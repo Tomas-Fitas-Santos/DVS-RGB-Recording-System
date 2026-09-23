@@ -1,0 +1,4 @@
+/build/
+/cmake-build-*/
+*.aedat4
+*.aedat4.json
