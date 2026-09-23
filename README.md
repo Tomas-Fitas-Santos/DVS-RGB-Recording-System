@@ -11,7 +11,7 @@ This branch currently contains the **DVXplorer-only recorder** for one Raspberry
 - Provides a touchscreen-friendly settings screen. Settings and recording directory can be changed only between recordings. One worker thread handles USB capture, AEDAT4 writing, and the cheap preview rasterization; the Qt GUI runs on its normal thread. There is no unbounded event queue or separate processing thread.
 - Remembers successfully applied settings across app restarts on the Pi.
 
-Hardware background activity and refractory filtering **remove events before they reach the recorder**. Both are off by default to retain all events the camera delivers. ON/OFF contrast defaults to 9, the DVXplorer default in the current API documentation. The 250 µs filter values are hardware units, not milliseconds.
+ON/OFF contrast defaults to 9. This recorder does not apply software event filters, so every event delivered by the DVXplorer is saved. The DVXplorer API used here does not offer background activity or refractory filter setters.
 
 ## Build on the Raspberry Pi
 
@@ -30,7 +30,7 @@ If `dv-processing` is not found, install its C++ development package or pass its
 ## Field use
 
 1. Connect a full-size DVXplorer to a USB 3 port. Start the app and wait for the camera name and resolution to appear.
-2. Open **Settings** while idle. Choose an output directory and adjust ON/OFF contrast or hardware filters if needed. Tap **Apply settings** and wait for the acknowledgement.
+2. Open **Settings** while idle. Choose an output directory and adjust ON/OFF contrast and the preview interval if needed. Tap **Apply settings** and wait for the acknowledgement.
 3. Tap **Start recording**. A new UTC-named AEDAT4 file is created. The event and trigger counters update while recording. **Settings** is disabled.
 4. Tap **Stop recording** and wait for **Saved ...** before disconnecting power. The AEDAT4 writer finalizes its index when closed.
 5. Inspect the file with `dv-filestat -v /path/to/file.aedat4` or open it with `dv::io::MonoCameraRecording` / DV GUI. When testing the external trigger wiring, verify the file actually contains trigger events and that the count rises.

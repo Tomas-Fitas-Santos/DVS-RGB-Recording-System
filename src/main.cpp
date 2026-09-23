@@ -46,8 +46,6 @@ struct Settings {
     QString outputDirectory = QDir::homePath() + "/DVXplorerRecordings";
     int contrastOn = 9;
     int contrastOff = 9;
-    int backgroundActivityTicks = 0; // Hardware filter units: 250 microseconds.
-    int refractoryTicks = 0;         // Hardware filter units: 250 microseconds.
     int previewIntervalMs = 50;
 };
 
@@ -60,8 +58,6 @@ Settings loadSavedSettings() {
     }
     settings.contrastOn = std::clamp(saved.value("contrastOn", 9).toInt(), 0, 17);
     settings.contrastOff = std::clamp(saved.value("contrastOff", 9).toInt(), 0, 17);
-    settings.backgroundActivityTicks = std::clamp(saved.value("backgroundActivityTicks", 0).toInt(), 0, 65535);
-    settings.refractoryTicks = std::clamp(saved.value("refractoryTicks", 0).toInt(), 0, 65535);
     settings.previewIntervalMs = std::clamp(saved.value("previewIntervalMs", 50).toInt(), 33, 250);
     return settings;
 }
@@ -71,13 +67,11 @@ void saveSettings(const Settings &settings) {
     saved.setValue("outputDirectory", settings.outputDirectory);
     saved.setValue("contrastOn", settings.contrastOn);
     saved.setValue("contrastOff", settings.contrastOff);
-    saved.setValue("backgroundActivityTicks", settings.backgroundActivityTicks);
-    saved.setValue("refractoryTicks", settings.refractoryTicks);
     saved.setValue("previewIntervalMs", settings.previewIntervalMs);
 }
 
 fs::path nativePath(const QString &path) {
-    return fs::u8path(path.toUtf8().constData());
+    return fs::path(path.toUtf8().constData());
 }
 
 QString utcNow() {
@@ -157,8 +151,6 @@ private:
     static void configure(dv::io::camera::DVXplorer &camera, const Settings &settings) {
         camera.setContrastThresholdOn(settings.contrastOn);
         camera.setContrastThresholdOff(settings.contrastOff);
-        camera.setBackgroundActivityFilter(settings.backgroundActivityTicks);
-        camera.setRefractoryPeriodFilter(settings.refractoryTicks);
         // Both edges are retained for later alignment with the RGB shutter/trigger.
         camera.setDetectorRisingEdges(true);
         camera.setDetectorFallingEdges(true);
@@ -185,8 +177,6 @@ private:
             {"trigger_count", static_cast<qint64>(session.triggers)},
             {"contrast_on", session.settings.contrastOn},
             {"contrast_off", session.settings.contrastOff},
-            {"background_activity_250us", session.settings.backgroundActivityTicks},
-            {"refractory_250us", session.settings.refractoryTicks},
             {"preview_interval_ms", session.settings.previewIntervalMs},
             {"error", error}
         };
@@ -296,7 +286,7 @@ private:
                         }
                     }
 
-                    if (auto events = camera.getNextEventBatch(); events && !events->empty()) {
+                    if (auto events = camera.getNextEventBatch(); events && !events->isEmpty()) {
                         if (writer) {
                             writer->writeEvents(*events); // Native timestamps and all received events.
                             session->events += events->size();
@@ -439,17 +429,13 @@ public:
         form->addRow("Recording directory", outputRow);
         on_ = spin(0, 17, 9, formContainer);
         off_ = spin(0, 17, 9, formContainer);
-        background_ = spin(0, 65535, 0, formContainer);
-        refractory_ = spin(0, 65535, 0, formContainer);
         interval_ = spin(33, 250, 50, formContainer);
         loadSettings(settings_);
         form->addRow("ON contrast (0-17)", on_);
         form->addRow("OFF contrast (0-17)", off_);
-        form->addRow("Background filter (250 us units; 0 = off)", background_);
-        form->addRow("Refractory filter (250 us units; 0 = off)", refractory_);
         form->addRow("Preview interval (ms)", interval_);
-        auto *note = new QLabel("Hardware filters remove events before saving. Keep both at 0 for an unfiltered stream. "
-            "The preview setting affects only the screen. Settings are locked during recording.", formContainer);
+        auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
+            "Settings are locked during recording.", formContainer);
         note->setWordWrap(true);
         form->addRow(note);
         scroll->setWidget(formContainer);
@@ -546,16 +532,13 @@ private:
     }
 
     Settings readSettings() const {
-        return {output_->text().trimmed(), on_->value(), off_->value(),
-            background_->value(), refractory_->value(), interval_->value()};
+        return {output_->text().trimmed(), on_->value(), off_->value(), interval_->value()};
     }
 
     void loadSettings(const Settings &settings) {
         output_->setText(settings.outputDirectory);
         on_->setValue(settings.contrastOn);
         off_->setValue(settings.contrastOff);
-        background_->setValue(settings.backgroundActivityTicks);
-        refractory_->setValue(settings.refractoryTicks);
         interval_->setValue(settings.previewIntervalMs);
     }
 
@@ -577,8 +560,6 @@ private:
     QLineEdit *output_ = nullptr;
     QSpinBox *on_ = nullptr;
     QSpinBox *off_ = nullptr;
-    QSpinBox *background_ = nullptr;
-    QSpinBox *refractory_ = nullptr;
     QSpinBox *interval_ = nullptr;
     QPixmap lastImage_;
     bool ready_ = false;
