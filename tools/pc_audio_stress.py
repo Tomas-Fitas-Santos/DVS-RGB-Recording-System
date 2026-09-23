@@ -188,8 +188,10 @@ def analyze(args):
                        for w in metrics)
     report = {"protocol": "pc-audio-stress-analysis-v1", "aedat4": str(args.aedat4),
               "frequency_hz": manifest["requested_hz"], "total_recorded_events": total_events,
+              "aedat4_bytes": args.aedat4.stat().st_size,
               "selected_roi_events": len(timestamps), "roi": args.roi, "polarity": args.polarity,
               "complete_windows": seconds, "responsive_windows": good_windows,
+              "peak_roi_events_per_second": max((w["events"] for w in metrics), default=0),
               "audio_output_underflow": manifest.get("audio_output_underflow"),
               "audio_status": manifest.get("audio_status"), "windows": metrics,
               "analysis_start_us": args.start_us if args.start_us is not None else
