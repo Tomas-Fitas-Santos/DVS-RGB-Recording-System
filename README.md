@@ -11,7 +11,7 @@ This branch currently contains the **DVXplorer-only recorder** for one Raspberry
 - Provides a touchscreen-friendly settings screen. Settings and recording directory can be changed only between recordings. One worker thread handles USB capture, AEDAT4 writing, and the cheap preview rasterization; the Qt GUI runs on its normal thread. There is no unbounded event queue or separate processing thread.
 - Remembers successfully applied settings across app restarts on the Pi.
 
-ON/OFF contrast defaults to 9. This recorder does not apply software event filters, so every event delivered by the DVXplorer is saved. The DVXplorer API used here does not offer background activity or refractory filter setters.
+Hardware background activity and refractory filtering **remove events before they reach the recorder**. Both are off by default to retain all events the camera delivers. ON/OFF contrast defaults to 9, the DVXplorer default in the current API documentation. The 250 µs filter values are hardware units, not milliseconds.
 
 ## Build on the Raspberry Pi
 
@@ -30,12 +30,41 @@ If `dv-processing` is not found, install its C++ development package or pass its
 ## Field use
 
 1. Connect a full-size DVXplorer to a USB 3 port. Start the app and wait for the camera name and resolution to appear.
-2. Open **Settings** while idle. Choose an output directory and adjust ON/OFF contrast and the preview interval if needed. Tap **Apply settings** and wait for the acknowledgement.
+2. Open **Settings** while idle. Choose an output directory and adjust ON/OFF contrast or hardware filters if needed. Tap **Apply settings** and wait for the acknowledgement.
 3. Tap **Start recording**. A new UTC-named AEDAT4 file is created. The event and trigger counters update while recording. **Settings** is disabled.
 4. Tap **Stop recording** and wait for **Saved ...** before disconnecting power. The AEDAT4 writer finalizes its index when closed.
 5. Inspect the file with `dv-filestat -v /path/to/file.aedat4` or open it with `dv::io::MonoCameraRecording` / DV GUI. When testing the external trigger wiring, verify the file actually contains trigger events and that the count rises.
 
 The app stops a recording when free space drops below 128 MiB, and refuses to start when less than 256 MiB is available. An interrupted session is marked in its metadata if the process is still running. Sudden power loss can leave the current AEDAT4 incomplete, so stop and wait for completion before powering down.
+
+## PC-driven 600 Hz recording test
+
+`tools/pc_audio_stress.py` runs **on a separate PC**, not on the Raspberry Pi. It plays a precisely sampled sine tone through a physical speaker while the existing Pi application records its *visible* diaphragm with the DVXplorer. No microcontroller is required. A monitor animation would be limited by the monitor refresh rate; the audio output is a way to excite actual mechanical motion at 600 Hz. A hidden laptop speaker is not a suitable target: the DVXplorer must see a moving, high-contrast mark or edge on an exposed speaker cone. At 600 Hz the displacement may be too small for the available lens; move the camera closer, focus on the cone and use oblique steady lighting. Test 50 or 100 Hz first to establish that it yields repeatable events.
+
+This checks whether the recorded optical event stream has a sustained periodic response. It does **not** provide a separate measurement of the cone's actual displacement or an electrical reference for every cycle. A lack of visible response may indicate an unsuitable speaker, optics, lighting or ROI as well as capture problems; it is not evidence by itself that the Pi dropped events. A definitive loss measurement would require a separately measured stimulus or a hardware timing signal sent to the DVXplorer's external input.
+
+On the **PC**, use a Python environment with NumPy, `sounddevice`, and the Python `dv-processing` package for offline analysis:
+
+```powershell
+python -m pip install numpy sounddevice dv-processing
+python -m sounddevice
+```
+
+The second command lists audio output device indices. With a speaker connected and its cone visible to the camera, start `./build/dvxplorer_recorder` on the Pi and press **Start recording**. Then on the PC run, replacing device index if needed:
+
+```powershell
+python tools/pc_audio_stress.py play --hz 600 --duration 30 --device 3 --manifest trial_600.json
+```
+
+The script waits 5 seconds before playback. The Pi stays in its ordinary recording mode throughout. After the tone ends, stop the Pi recording and wait for **Saved**. Copy the `.aedat4` and its `.aedat4.json` sidecar to the PC. Find a tight rectangle containing the moving edge in the DVXplorer event preview, using sensor coordinates `x0,y0,x1,y1`. For a DVXplorer the image is 640 × 480; the `x1,y1` limits are exclusive. Analyze on the PC:
+
+```powershell
+python tools/pc_audio_stress.py analyze .\DVXplorer_YYYYMMDDTHHMMSSsssZ.aedat4 --manifest trial_600.json --roi 260,170,380,290 --report trial_600_report.json
+```
+
+For a frequency sweep, repeat the same recording, playback, copy, and analysis at 50, 100, 200, 400, and 600 Hz, with a **separate manifest and AEDAT4 per frequency**. Specify `--ssh birds@BIRDS` on `play` to sample the Pi CPU, memory, temperature, and throttling once per second over SSH (`--monitor pi_stress_monitor.csv`); this requires key-based SSH authentication. Include the monitor CSV with `analyze --monitor pi_stress_monitor.csv`. The CPU percentage in the CSV is the lifetime average reported by `ps`, so use it only as a broad load indicator.
+
+The JSON report includes selected ROI event counts, one-second optical cycle coverage and frequency coherence at the requested frequency and its second harmonic, recorder metadata consistency, and optional Pi thermal data. `CONSISTENT_OPTICAL_RESPONSE` means those checks met the configurable thresholds (`--coverage`, `--coherence`, `--min-events`) in every analyzed full second. It is **not** a proof of zero lost USB events or guaranteed bird-motion performance. If there are events in the ROI before the tone, pass `--start-us CAMERA_TIMESTAMP` to set the first stimulus event explicitly. Keep the scene still and the selected ROI quiet before the tone so the automatic start estimate is reliable.
 
 ## Verification status
 
