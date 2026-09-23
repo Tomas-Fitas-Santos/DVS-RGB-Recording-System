@@ -38,7 +38,8 @@ def start_monitor(destination, path, seconds):
               "t=$(date -u +%s); "
               "temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null); "
               "throttle=$(vcgencmd get_throttled 2>/dev/null); "
-              "read -r cpu rss < <(ps -C dvxplorer_recorder -o %cpu=,rss= | head -n 1); "
+              "read -r cpu rss < <(ps -eo comm=,%cpu=,rss= | "
+              "awk '$1 ~ /^dvxplorer_recor/ {print $2, $3; exit}'); "
               "printf '%s,%s,%s,%s,%s\\n' \"$t\" \"$temp\" \"$throttle\" \"$cpu\" \"$rss\"; "
               "sleep 1; done")
     process = subprocess.Popen(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
