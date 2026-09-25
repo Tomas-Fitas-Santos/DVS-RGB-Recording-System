@@ -1,5 +1,6 @@
 #include <dv-processing/io/camera/dvxplorer.hpp>
 #include <dv-processing/io/mono_camera_writer.hpp>
+#include "rgb_recorder.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -42,6 +43,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -65,6 +67,7 @@ struct Settings {
     bool performanceMonitoring = false;
     bool temperatureMonitoring = false;
     bool storageMonitoring = false;
+    QString rgbSerial;
 };
 
 Settings loadSavedSettings() {
@@ -80,6 +83,7 @@ Settings loadSavedSettings() {
     settings.performanceMonitoring = saved.value("performanceMonitoring", false).toBool();
     settings.temperatureMonitoring = saved.value("temperatureMonitoring", false).toBool();
     settings.storageMonitoring = saved.value("storageMonitoring", false).toBool();
+    settings.rgbSerial = saved.value("rgbSerial", "").toString().trimmed();
     return settings;
 }
 
@@ -92,6 +96,7 @@ void saveSettings(const Settings &settings) {
     saved.setValue("performanceMonitoring", settings.performanceMonitoring);
     saved.setValue("temperatureMonitoring", settings.temperatureMonitoring);
     saved.setValue("storageMonitoring", settings.storageMonitoring);
+    saved.setValue("rgbSerial", settings.rgbSerial);
 }
 
 fs::path nativePath(const QString &path) {
@@ -284,6 +289,7 @@ signals:
     void settingsApplied(bool success, const QString &message);
     void statistics(quint64 events, quint64 triggers);
     void monitoring(const QString &message);
+    void rgbStatistics(quint64 frames, quint64 missing, quint64 incomplete);
 
 private:
     struct Commands {
@@ -327,6 +333,9 @@ private:
         std::optional<double> finalizeMs;
         quint64 peakEventsPerSecond = 0;
         std::optional<double> maxCaptureLagMs;
+        RgbRecorder::Summary rgb;
+        fs::path rgbRawFile;
+        fs::path rgbIndexFile;
     };
 
     static void saveMetadata(const Session &session, const QString &state, const QString &error = {}) {
@@ -350,6 +359,22 @@ private:
                 ? QJsonValue(*session.finalizeMs) : QJsonValue()},
             {"peak_events_per_second", static_cast<qint64>(session.peakEventsPerSecond)},
             {"event_loss_count_available", false},
+            {"rgb_camera", "MER2-302-56U3C"},
+            {"rgb_pixel_format", "BayerRG8"},
+            {"rgb_camera_timestamp_units", "native_ticks_unscaled"},
+            {"rgb_serial", QString::fromStdString(session.rgb.serial)},
+            {"rgb_start_utc", QString::fromStdString(session.rgb.startUtc)},
+            {"rgb_end_utc", QString::fromStdString(session.rgb.endUtc)},
+            {"rgb_width", static_cast<int>(session.rgb.width)},
+            {"rgb_height", static_cast<int>(session.rgb.height)},
+            {"rgb_frames", static_cast<qint64>(session.rgb.frames)},
+            {"rgb_missing_frame_ids", static_cast<qint64>(session.rgb.missingFrameIds)},
+            {"rgb_incomplete_frames", static_cast<qint64>(session.rgb.incompleteFrames)},
+            {"rgb_queue_overflows", static_cast<qint64>(session.rgb.queueOverflows)},
+            {"rgb_bytes", static_cast<qint64>(session.rgb.bytes)},
+            {"rgb_error", QString::fromStdString(session.rgb.error)},
+            {"rgb_raw_file", QString::fromStdString(session.rgbRawFile.filename().string())},
+            {"rgb_frame_index", QString::fromStdString(session.rgbIndexFile.filename().string())},
             {"max_relative_capture_lag_ms", session.maxCaptureLagMs
                 ? QJsonValue(*session.maxCaptureLagMs) : QJsonValue()},
             {"monitor_csv", session.monitorFile.empty()
@@ -412,7 +437,13 @@ private:
             {"peak_events_per_second", "Peak recorded events in a camera-timestamp second"},
             {"relative_capture_lag_ms", "Relative capture lag (ms)"},
             {"lost_events_total", "Lost events, cumulative"},
-            {"lost_events_per_s", "Lost events per second"}
+            {"lost_events_per_s", "Lost events per second"},
+            {"rgb_frames_total", "RGB frames written, cumulative"},
+            {"rgb_frame_rate_hz", "RGB frames written per host second"},
+            {"rgb_raw_mib_s", "RGB raw bytes written (MiB/s)"},
+            {"rgb_missing_frame_ids", "RGB missing frame IDs, cumulative"},
+            {"rgb_incomplete_frames", "RGB incomplete frames, cumulative"},
+            {"rgb_queue_overflows", "RGB writer queue overflows, cumulative"}
         };
 
         QStringList columns;
@@ -473,6 +504,16 @@ private:
             QString("- Report generated (UTC): %1").arg(utcNow()),
             QString("- Recorded events: %1").arg(groupedCount(session.events)),
             QString("- Recorded triggers: %1").arg(groupedCount(session.triggers)),
+            QString("- RGB camera: MER2-302-56U3C (%1)").arg(QString::fromStdString(session.rgb.serial)),
+            QString("- RGB frames: %1").arg(groupedCount(session.rgb.frames)),
+            QString("- RGB missing frame IDs / incomplete frames / queue overflows: %1 / %2 / %3")
+                .arg(groupedCount(session.rgb.missingFrameIds),
+                    groupedCount(session.rgb.incompleteFrames), groupedCount(session.rgb.queueOverflows)),
+            QString("- RGB raw / frame index: `%1` / `%2`")
+                .arg(QString::fromStdString(session.rgbRawFile.filename().string()),
+                     QString::fromStdString(session.rgbIndexFile.filename().string())),
+            QString("- RGB capture start/end (UTC): %1 / %2")
+                .arg(QString::fromStdString(session.rgb.startUtc), QString::fromStdString(session.rgb.endUtc)),
             QString("- Peak recorded events in a one-second camera-timestamp bin: %1")
                 .arg(groupedCount(session.peakEventsPerSecond)),
             QString("- AEDAT4 size: %1 bytes").arg(completedFileSize(session.file)),
@@ -491,6 +532,7 @@ private:
                 .arg(session.settings.storageMonitoring ? "on" : "off")
         };
         if (!reason.isEmpty()) report << QString("- Interruption reason: %1").arg(reason);
+        if (!session.rgb.error.empty()) report << "- RGB error: " + QString::fromStdString(session.rgb.error);
         if (!session.monitorError.isEmpty()) report << "- Monitoring error: " + session.monitorError;
         report << "" << "## Monitoring samples" << "";
         if (session.monitorFile.empty()) {
@@ -556,6 +598,7 @@ private:
             << "Lost-event totals and rates are unavailable through this recorder's camera interface; blank values do not mean zero loss."
             << "File growth and Linux write counts can reflect buffering; device writes include other processes."
             << "Relative capture lag is a change from the first event batch, not absolute sensor latency."
+            << "RGB frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss. RGB and DVXplorer camera clocks are independent without an external electrical sync signal."
             << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
             << "";
 
@@ -577,6 +620,7 @@ private:
             }
 
             std::optional<dv::io::MonoCameraWriter> writer;
+            std::unique_ptr<RgbRecorder> rgb;
             std::optional<Session> session;
             std::optional<std::ofstream> monitorLog;
             try {
@@ -605,6 +649,7 @@ private:
                 auto previousWrittenBytes = current.storageMonitoring
                     ? writtenBytes() : std::optional<unsigned long long>{};
                 quint64 previousEvents = 0, previousTriggers = 0;
+                quint64 previousRgbFrames = 0, previousRgbBytes = 0;
                 double maxPollGapMs = 0;
                 double maxWriterCallMs = 0;
                 double writerTimeMs = 0;
@@ -703,6 +748,12 @@ private:
                         : std::optional<double>(session ? (session->events - previousEvents) / elapsed : 0);
                     const std::optional<double> triggerRate = shortFinalSample ? std::nullopt
                         : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
+                    const auto rgbNow = rgb ? rgb->snapshot() : (session ? session->rgb : RgbRecorder::Summary{});
+                    const std::optional<double> rgbRate = shortFinalSample ? std::nullopt
+                        : std::optional<double>((rgbNow.frames - previousRgbFrames) / elapsed);
+                    const std::optional<double> rgbMiBs = shortFinalSample ? std::nullopt
+                        : std::optional<double>((rgbNow.bytes - previousRgbBytes)
+                            / (1024.0 * 1024.0) / elapsed);
                     QStringList summary;
                     if (current.performanceMonitoring) {
                         summary << QString("Recorded events: %1/s | Pi CPU used by app: %2%")
@@ -727,6 +778,12 @@ private:
                             .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a");
                         summary << "Lost events: unavailable (total and per second)";
                     }
+                    if (session) {
+                        summary << QString("RGB: %1 frames/s | raw written: %2 MiB/s | missing IDs: %3")
+                            .arg(rgbRate ? QString::number(*rgbRate, 'f', 1) : "n/a")
+                            .arg(rgbMiBs ? QString::number(*rgbMiBs, 'f', 1) : "n/a")
+                            .arg(groupedCount(rgbNow.missingFrameIds));
+                    }
                     if (session && !session->monitorError.isEmpty()) {
                         summary << session->monitorError;
                     }
@@ -750,7 +807,10 @@ private:
                             << (session->finalizeMs ? csvNumber(*session->finalizeMs) : "") << ','
                             << session->peakEventsPerSecond << ','
                             << (current.storageMonitoring ? csvNumber(latestCaptureLagMs) : "")
-                            << ",,," << (current.storageMonitoring ? "unavailable" : "disabled") << '\n'
+                            << ",,," << (current.storageMonitoring ? "unavailable" : "disabled") << ','
+                            << rgbNow.frames << ',' << csvNumber(rgbRate) << ',' << csvNumber(rgbMiBs)
+                            << ',' << rgbNow.missingFrameIds << ',' << rgbNow.incompleteFrames
+                            << ',' << rgbNow.queueOverflows << '\n'
                             << std::flush;
                         if (!monitorLog->good()) {
                             session->monitorError = "Monitoring CSV write failed";
@@ -760,6 +820,8 @@ private:
                     }
                     previousEvents = session ? session->events : 0;
                     previousTriggers = session ? session->triggers : 0;
+                    previousRgbFrames = rgbNow.frames;
+                    previousRgbBytes = rgbNow.bytes;
                     maxPollGapMs = 0;
                     maxWriterCallMs = 0;
                     writerTimeMs = 0;
@@ -770,6 +832,24 @@ private:
                     if (!writer) {
                         return;
                     }
+                    QString outcome = state;
+                    QString detail = reason;
+                    if (rgb) {
+                        session->rgb = rgb->stop();
+                        if (!session->rgb.error.empty()) {
+                            outcome = "interrupted";
+                            detail = QString::fromStdString(session->rgb.error);
+                        }
+                        else if (session->rgb.frames == 0 || session->rgb.missingFrameIds > 0
+                            || session->rgb.incompleteFrames > 0) {
+                            outcome = "interrupted";
+                            detail = QString("RGB frames: %1; missing IDs: %2; incomplete: %3")
+                                .arg(groupedCount(session->rgb.frames),
+                                     groupedCount(session->rgb.missingFrameIds),
+                                     groupedCount(session->rgb.incompleteFrames));
+                        }
+                        rgb.reset();
+                    }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     writer.reset(); // AEDAT4 index and buffered packets are finalized here.
                     session->endUtc = utcNow();
@@ -778,24 +858,24 @@ private:
                     sampleMonitor(std::chrono::steady_clock::now(), true);
                     monitorLog.reset();
                     try {
-                        saveReport(*session, state, reason);
+                        saveReport(*session, outcome, detail);
                     }
                     catch (const std::exception &e) {
                         session->reportError = QString::fromUtf8(e.what());
                         session->reportFile.clear();
                     }
                     try {
-                        saveMetadata(*session, state, reason);
+                        saveMetadata(*session, outcome, detail);
                     }
                     catch (const std::exception &e) {
                         emit cameraStatus(QString("Metadata error: %1").arg(e.what()), true);
                     }
                     const QString path = QString::fromStdString(session->file.string());
-                    emit recordingState(false, state == "complete"
-                        ? QString("Saved %1 | Peak: %2 recorded events/s | Report: %3")
-                            .arg(path, groupedCount(session->peakEventsPerSecond),
+                    emit recordingState(false, outcome == "complete"
+                        ? QString("Saved %1 | RGB: %2 frames | Peak: %3 recorded events/s | Report: %4")
+                            .arg(path, groupedCount(session->rgb.frames), groupedCount(session->peakEventsPerSecond),
                                 session->reportError.isEmpty() ? "saved" : session->reportError)
-                        : QString("Recording interrupted: %1 (%2)").arg(reason, path));
+                        : QString("Recording interrupted: %1 (%2)").arg(detail, path));
                     session.reset();
                 };
 
@@ -841,8 +921,8 @@ private:
                             const fs::path directory = nativePath(current.outputDirectory);
                             fs::create_directories(directory);
                             const auto availableBytes = fs::space(directory).available;
-                            if (availableBytes < 256ULL * 1024 * 1024) {
-                                throw std::runtime_error("Less than 256 MiB free in output directory");
+                            if (availableBytes < 2ULL * 1024 * 1024 * 1024) {
+                                throw std::runtime_error("Less than 2 GiB free in output directory");
                             }
                             lastDiskFreeMiB = availableBytes / (1024.0 * 1024.0);
                             fs::path output;
@@ -851,7 +931,9 @@ private:
                                 const QString name = "DVXplorer_" + stamp
                                     + (index ? "_" + QString::number(index) : QString{}) + ".aedat4";
                                 output = directory / nativePath(name);
-                                if (!fs::exists(output) && !fs::exists(output.string() + ".json")
+                                if (!fs::exists(output) && !fs::exists(output.string() + ".rgb.raw")
+                                    && !fs::exists(output.string() + ".rgb.frames.csv")
+                                    && !fs::exists(output.string() + ".json")
                                     && !fs::exists(output.string() + ".monitor.csv")
                                     && !fs::exists(output.string() + ".report.md")) {
                                     break;
@@ -859,6 +941,12 @@ private:
                             }
                             writer.emplace(output.string(), camera);
                             session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
+                            rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString());
+                            rgb->start();
+                            session->rgbRawFile = rgb->rawPath();
+                            session->rgbIndexFile = rgb->indexPath();
+                            session->rgb = rgb->snapshot();
+                            session->startUtc = utcNow();
                             session->reportFile = fs::path(output.string() + ".report.md");
                             if (current.performanceMonitoring || current.temperatureMonitoring
                                 || current.storageMonitoring) {
@@ -884,7 +972,8 @@ private:
                                         "writeback_mib,io_psi_some_avg10,storage_device_write_mib_s,"
                                         "device_io_busy_pct,writer_finalize_ms,peak_events_per_second,"
                                         "relative_capture_lag_ms,lost_events_total,lost_events_per_s,"
-                                        "loss_count_status\n" << std::flush;
+                                        "loss_count_status,rgb_frames_total,rgb_frame_rate_hz,rgb_raw_mib_s,"
+                                        "rgb_missing_frame_ids,rgb_incomplete_frames,rgb_queue_overflows\n" << std::flush;
                                     if (!monitorLog->good()) {
                                         session->monitorError = "Cannot write monitoring CSV header";
                                         monitorLog.reset();
@@ -903,7 +992,7 @@ private:
                             previousFileSize.reset();
                             previousBlockStats = current.storageMonitoring
                                 ? readBlockStats(blockStatsFile) : std::optional<BlockStats>{};
-                            previousEvents = previousTriggers = 0;
+                            previousEvents = previousTriggers = previousRgbFrames = previousRgbBytes = 0;
                             maxPollGapMs = maxWriterCallMs = writerTimeMs = 0;
                             firstEventTimestampUs.reset();
                             eventSecondBin = eventSecondCount = 0;
@@ -912,9 +1001,14 @@ private:
                             latestCaptureLagMs.reset();
                             saveMetadata(*session, "recording");
                             emit statistics(0, 0);
+                            emit rgbStatistics(0, 0, 0);
                             emit recordingState(true, QString("Recording %1").arg(QString::fromStdString(output.filename().string())));
                         }
                         catch (const std::exception &e) {
+                            if (rgb) {
+                                if (session) session->rgb = rgb->stop();
+                                rgb.reset();
+                            }
                             monitorLog.reset();
                             writer.reset();
                             session.reset();
@@ -1015,13 +1109,18 @@ private:
                     }
                     if (writer && now - lastStatistics >= 500ms) {
                         emit statistics(session->events, session->triggers);
+                        if (rgb) {
+                            const auto summary = rgb->snapshot();
+                            emit rgbStatistics(summary.frames, summary.missingFrameIds, summary.incompleteFrames);
+                            if (!summary.error.empty()) throw std::runtime_error(summary.error);
+                        }
                         lastStatistics = now;
                     }
-                    if (writer && now - lastDiskCheck >= 2s) {
+                    if (writer && now - lastDiskCheck >= 500ms) {
                         const auto availableBytes = fs::space(session->file.parent_path()).available;
                         lastDiskFreeMiB = availableBytes / (1024.0 * 1024.0);
-                        if (availableBytes < 128ULL * 1024 * 1024) {
-                            throw std::runtime_error("Low disk space (under 128 MiB)");
+                        if (availableBytes < 1ULL * 1024 * 1024 * 1024) {
+                            throw std::runtime_error("Low disk space (under 1 GiB)");
                         }
                         lastDiskCheck = now;
                     }
@@ -1036,6 +1135,7 @@ private:
             catch (const std::exception &e) {
                 const QString error = QString::fromUtf8(e.what());
                 if (writer && session) {
+                    if (rgb) { session->rgb = rgb->stop(); rgb.reset(); }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     writer.reset();
                     session->endUtc = utcNow();
@@ -1085,7 +1185,7 @@ private:
 class MainWindow final : public QWidget {
 public:
     MainWindow(Recorder &recorder, Settings initial) : recorder_(recorder), settings_(std::move(initial)) {
-        setWindowTitle("DVXplorer Recorder");
+        setWindowTitle("DVXplorer + Daheng Recorder");
         resize(850, 600);
 
         auto *root = new QVBoxLayout(this);
@@ -1104,6 +1204,8 @@ public:
         liveLayout->addWidget(status_);
         counts_ = new QLabel("Events: 0 | Triggers: 0", live);
         liveLayout->addWidget(counts_);
+        rgbCounts_ = new QLabel("RGB: 0 frames | Missing IDs: 0 | Incomplete: 0", live);
+        liveLayout->addWidget(rgbCounts_);
         monitorStatus_ = new QLabel("Monitoring off", live);
         monitorStatus_->setWordWrap(true);
         liveLayout->addWidget(monitorStatus_);
@@ -1137,14 +1239,18 @@ public:
         performance_ = new QCheckBox("Performance monitoring (CPU, memory, event rate, loop delays)", formContainer);
         temperature_ = new QCheckBox("Temperature monitoring", formContainer);
         storage_ = new QCheckBox("Storage monitoring (write rate, stalls, disk backlog)", formContainer);
+        rgbSerial_ = new QLineEdit(formContainer);
+        rgbSerial_->setPlaceholderText("Auto-select MER2-302-56U3C");
         loadSettings(settings_);
         form->addRow("ON contrast (0-17)", on_);
         form->addRow("OFF contrast (0-17)", off_);
         form->addRow("Preview interval (ms)", interval_);
+        form->addRow("RGB serial (optional)", rgbSerial_);
         form->addRow(performance_);
         form->addRow(temperature_);
         form->addRow(storage_);
         auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
+            "RGB frames are saved as uncompressed BayerRG8 with a frame index. Both cameras are required to record. "
             "Monitoring samples once per second and saves a CSV beside the AEDAT4. "
             "Settings are locked during recording.", formContainer);
         note->setWordWrap(true);
@@ -1189,7 +1295,7 @@ public:
         connect(record_, &QPushButton::clicked, this, [this] {
             if (recording_) {
                 record_->setEnabled(false);
-                status_->setText("Finalizing AEDAT4...");
+                status_->setText("Finalizing DVXplorer and RGB files...");
                 recorder_.stop();
             }
             else if (ready_ && !busy_) {
@@ -1226,6 +1332,11 @@ public:
             counts_->setText(QString("Events: %1 | Triggers: %2")
                 .arg(groupedCount(events), groupedCount(triggers)));
         });
+        connect(&recorder_, &Recorder::rgbStatistics, this,
+            [this](quint64 frames, quint64 missing, quint64 incomplete) {
+                rgbCounts_->setText(QString("RGB: %1 frames | Missing IDs: %2 | Incomplete: %3")
+                    .arg(groupedCount(frames), groupedCount(missing), groupedCount(incomplete)));
+            });
         connect(&recorder_, &Recorder::monitoring, this, [this](const QString &message) {
             monitorStatus_->setText(message);
         });
@@ -1252,7 +1363,8 @@ private:
 
     Settings readSettings() const {
         return {output_->text().trimmed(), on_->value(), off_->value(), interval_->value(),
-            performance_->isChecked(), temperature_->isChecked(), storage_->isChecked()};
+            performance_->isChecked(), temperature_->isChecked(), storage_->isChecked(),
+            rgbSerial_->text().trimmed()};
     }
 
     void loadSettings(const Settings &settings) {
@@ -1263,6 +1375,7 @@ private:
         performance_->setChecked(settings.performanceMonitoring);
         temperature_->setChecked(settings.temperatureMonitoring);
         storage_->setChecked(settings.storageMonitoring);
+        rgbSerial_->setText(settings.rgbSerial);
     }
 
     void updateButtons() {
@@ -1278,6 +1391,7 @@ private:
     QLabel *preview_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *counts_ = nullptr;
+    QLabel *rgbCounts_ = nullptr;
     QLabel *monitorStatus_ = nullptr;
     QPushButton *record_ = nullptr;
     QPushButton *settingsButton_ = nullptr;
@@ -1289,6 +1403,7 @@ private:
     QCheckBox *performance_ = nullptr;
     QCheckBox *temperature_ = nullptr;
     QCheckBox *storage_ = nullptr;
+    QLineEdit *rgbSerial_ = nullptr;
     QPixmap lastImage_;
     bool ready_ = false;
     bool recording_ = false;
