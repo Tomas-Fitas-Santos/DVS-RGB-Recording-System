@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -19,6 +20,13 @@ namespace dvxrec {
 // waits for disk I/O; a full queue interrupts the session instead of hiding loss.
 class RgbRecorder final {
 public:
+    struct Preview {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::vector<uint8_t> rgb;
+    };
+    using PreviewCallback = std::function<void(Preview)>;
+
     struct Summary {
         std::string serial;
         std::string startUtc;
@@ -33,7 +41,8 @@ public:
         std::string error;
     };
 
-    explicit RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial = {});
+    explicit RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial = {},
+        PreviewCallback previewCallback = {}, bool previewOnly = false);
     ~RgbRecorder();
     RgbRecorder(const RgbRecorder &) = delete;
     RgbRecorder &operator=(const RgbRecorder &) = delete;
@@ -60,6 +69,8 @@ private:
     std::filesystem::path rawPath_;
     std::filesystem::path indexPath_;
     std::string requestedSerial_;
+    PreviewCallback previewCallback_;
+    bool previewOnly_ = false;
     GX_DEV_HANDLE device_ = nullptr;
     bool libraryOpen_ = false;
     bool streamOn_ = false;
