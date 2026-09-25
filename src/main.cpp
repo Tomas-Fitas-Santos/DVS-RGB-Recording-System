@@ -283,6 +283,14 @@ public:
         return true;
     }
 
+    bool takeRgbPreview(QImage &image) {
+        QMutexLocker lock(&rgbPreviewMutex_);
+        if (latestRgbPreview_.isNull()) return false;
+        image = std::move(latestRgbPreview_);
+        latestRgbPreview_ = {};
+        return true;
+    }
+
 signals:
     void cameraStatus(const QString &message, bool ready);
     void recordingState(bool recording, const QString &message);
@@ -290,8 +298,18 @@ signals:
     void statistics(quint64 events, quint64 triggers);
     void monitoring(const QString &message);
     void rgbStatistics(quint64 frames, quint64 missing, quint64 incomplete);
+    void rgbCameraStatus(const QString &message);
 
 private:
+    void publishRgbPreview(RgbRecorder::Preview frame) {
+        if (!frame.width || !frame.height || frame.rgb.empty()) return;
+        QImage borrowed(frame.rgb.data(), static_cast<int>(frame.width),
+            static_cast<int>(frame.height), static_cast<int>(frame.width * 3), QImage::Format_RGB888);
+        QImage owned = borrowed.copy();
+        QMutexLocker lock(&rgbPreviewMutex_);
+        latestRgbPreview_ = std::move(owned);
+    }
+
     struct Commands {
         std::optional<Settings> apply;
         std::optional<Settings> start;
@@ -621,6 +639,7 @@ private:
 
             std::optional<dv::io::MonoCameraWriter> writer;
             std::unique_ptr<RgbRecorder> rgb;
+            std::unique_ptr<RgbRecorder> rgbPreview;
             std::optional<Session> session;
             std::optional<std::ofstream> monitorLog;
             try {
@@ -642,6 +661,10 @@ private:
                 auto lastMonitoring = lastPreview;
                 auto sessionStart = lastPreview;
                 auto lastLoopStart = lastPreview;
+                auto nextRgbPreviewAttempt = lastPreview;
+                const auto rgbPreviewCallback = [this](RgbRecorder::Preview frame) {
+                    publishRgbPreview(std::move(frame));
+                };
                 auto previousCpuClock = std::clock();
                 const long onlineCores = std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN));
                 auto previousSystemTicks = current.performanceMonitoring
@@ -888,6 +911,26 @@ private:
                             std::chrono::duration<double, std::milli>(loopStart - lastLoopStart).count());
                     }
                     lastLoopStart = loopStart;
+                    if (!writer && !rgb && rgbPreview && !rgbPreview->snapshot().error.empty()) {
+                        emit rgbCameraStatus("RGB preview stopped: "
+                            + QString::fromStdString(rgbPreview->snapshot().error));
+                        rgbPreview.reset();
+                        nextRgbPreviewAttempt = loopStart + 3s;
+                    }
+                    if (!writer && !rgb && !rgbPreview && loopStart >= nextRgbPreviewAttempt) {
+                        try {
+                            rgbPreview = std::make_unique<RgbRecorder>(fs::path{},
+                                current.rgbSerial.toStdString(), rgbPreviewCallback, true);
+                            rgbPreview->start();
+                            emit rgbCameraStatus("RGB live: MER2-302-56U3C ("
+                                + QString::fromStdString(rgbPreview->snapshot().serial) + ")");
+                        }
+                        catch (const std::exception &e) {
+                            rgbPreview.reset();
+                            emit rgbCameraStatus(QString("RGB unavailable: %1; retrying").arg(e.what()));
+                            nextRgbPreviewAttempt = loopStart + 3s;
+                        }
+                    }
                     const Commands commands = popCommands();
                     if (commands.quit) {
                         finish("complete");
@@ -898,6 +941,10 @@ private:
                     }
                     if (commands.apply && !writer) {
                         try {
+                            if (rgbPreview && current.rgbSerial != commands.apply->rgbSerial) {
+                                rgbPreview.reset();
+                                nextRgbPreviewAttempt = loopStart;
+                            }
                             configure(camera, *commands.apply);
                             current = *commands.apply;
                             lastMonitoring = std::chrono::steady_clock::now();
@@ -941,10 +988,13 @@ private:
                                     break;
                                 }
                             }
+                            rgbPreview.reset(); // Release the camera before opening the recording stream.
                             writer.emplace(output.string(), camera);
                             session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
-                            rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString());
+                            rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
+                                rgbPreviewCallback);
                             rgb->start();
+                            emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
                             session->rgbRawFile = rgb->rawPath();
                             session->rgbIndexFile = rgb->indexPath();
                             session->rgb = rgb->snapshot();
@@ -1181,6 +1231,8 @@ private:
     bool quit_ = false;
     QMutex previewMutex_;
     QImage latestPreview_;
+    QMutex rgbPreviewMutex_;
+    QImage latestRgbPreview_;
     std::thread thread_;
 };
 
@@ -1196,14 +1248,30 @@ public:
 
         auto *live = new QWidget(this);
         auto *liveLayout = new QVBoxLayout(live);
+        auto *previewRow = new QHBoxLayout;
+        auto *dvsPanel = new QVBoxLayout;
+        auto *rgbPanel = new QVBoxLayout;
+        dvsPanel->addWidget(new QLabel("DVXplorer events", live));
         preview_ = new QLabel("Waiting for DVXplorer...", live);
         preview_->setAlignment(Qt::AlignCenter);
-        preview_->setMinimumSize(320, 240);
+        preview_->setMinimumSize(220, 150);
         preview_->setStyleSheet("background:#101317;color:white;font-size:20px");
-        liveLayout->addWidget(preview_, 1);
+        dvsPanel->addWidget(preview_, 1);
+        rgbPanel->addWidget(new QLabel("Daheng RGB", live));
+        rgbPreview_ = new QLabel("Connecting to Daheng...", live);
+        rgbPreview_->setAlignment(Qt::AlignCenter);
+        rgbPreview_->setMinimumSize(220, 150);
+        rgbPreview_->setStyleSheet("background:#101317;color:white;font-size:20px");
+        rgbPanel->addWidget(rgbPreview_, 1);
+        previewRow->addLayout(dvsPanel, 1);
+        previewRow->addLayout(rgbPanel, 1);
+        liveLayout->addLayout(previewRow, 1);
         status_ = new QLabel("Connecting to DVXplorer...", live);
         status_->setWordWrap(true);
         liveLayout->addWidget(status_);
+        rgbStatus_ = new QLabel("Connecting to Daheng...", live);
+        rgbStatus_->setWordWrap(true);
+        liveLayout->addWidget(rgbStatus_);
         counts_ = new QLabel("Events: 0 | Triggers: 0", live);
         liveLayout->addWidget(counts_);
         rgbCounts_ = new QLabel("RGB: 0 frames | Missing IDs: 0 | Incomplete: 0", live);
@@ -1320,6 +1388,15 @@ public:
             status_->setText(message);
             updateButtons();
         });
+        connect(&recorder_, &Recorder::rgbCameraStatus, this, [this](const QString &message) {
+            rgbStatus_->setText(message);
+            if (!message.startsWith("RGB live:")) {
+                lastRgbImage_ = {};
+                rgbPreview_->clear();
+                rgbPreview_->setText(message.startsWith("RGB recording:")
+                    ? "Waiting for RGB frames..." : message);
+            }
+        });
         connect(&recorder_, &Recorder::settingsApplied, this, [this](bool success, const QString &message) {
             busy_ = false;
             if (success && pendingSettings_) {
@@ -1348,6 +1425,11 @@ public:
             if (recorder_.takePreview(image)) {
                 lastImage_ = QPixmap::fromImage(std::move(image));
                 preview_->setPixmap(lastImage_.scaled(preview_->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
+            }
+            if (recorder_.takeRgbPreview(image)) {
+                lastRgbImage_ = QPixmap::fromImage(std::move(image));
+                rgbPreview_->setPixmap(lastRgbImage_.scaled(rgbPreview_->size(),
+                    Qt::KeepAspectRatio, Qt::FastTransformation));
             }
         });
         timer->start(50);
@@ -1391,7 +1473,9 @@ private:
     std::optional<Settings> pendingSettings_;
     QStackedWidget *pages_ = nullptr;
     QLabel *preview_ = nullptr;
+    QLabel *rgbPreview_ = nullptr;
     QLabel *status_ = nullptr;
+    QLabel *rgbStatus_ = nullptr;
     QLabel *counts_ = nullptr;
     QLabel *rgbCounts_ = nullptr;
     QLabel *monitorStatus_ = nullptr;
@@ -1407,6 +1491,7 @@ private:
     QCheckBox *storage_ = nullptr;
     QLineEdit *rgbSerial_ = nullptr;
     QPixmap lastImage_;
+    QPixmap lastRgbImage_;
     bool ready_ = false;
     bool recording_ = false;
     bool busy_ = false;
