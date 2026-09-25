@@ -98,6 +98,14 @@ QString utcNow() {
     return QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
 }
 
+QString groupedCount(quint64 value) {
+    QString digits = QString::number(value);
+    for (int index = digits.size() - 3; index > 0; index -= 3) {
+        digits.insert(index, ',');
+    }
+    return digits;
+}
+
 std::optional<double> readNumber(const char *path, double divisor = 1.0) {
     std::ifstream file(path);
     double value = 0;
@@ -310,6 +318,8 @@ private:
         QString monitorError;
         std::string storageDeviceName;
         std::optional<double> finalizeMs;
+        quint64 peakEventsPerSecond = 0;
+        std::optional<double> maxCaptureLagMs;
     };
 
     static void saveMetadata(const Session &session, const QString &state, const QString &error = {}) {
@@ -331,6 +341,10 @@ private:
             {"aedat_bytes", completedFileSize(session.file)},
             {"writer_finalize_ms", session.finalizeMs
                 ? QJsonValue(*session.finalizeMs) : QJsonValue()},
+            {"peak_events_per_second", static_cast<qint64>(session.peakEventsPerSecond)},
+            {"event_loss_count_available", false},
+            {"max_relative_capture_lag_ms", session.maxCaptureLagMs
+                ? QJsonValue(*session.maxCaptureLagMs) : QJsonValue()},
             {"monitor_csv", session.monitorFile.empty()
                 ? QString{} : QString::fromStdString(session.monitorFile.filename().string())},
             {"monitor_error", session.monitorError},
@@ -377,6 +391,7 @@ private:
                 auto sessionStart = lastPreview;
                 auto lastLoopStart = lastPreview;
                 auto previousCpuClock = std::clock();
+                const long onlineCores = std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN));
                 auto previousSystemTicks = current.performanceMonitoring
                     ? systemCpuTicks() : std::optional<CpuTicks>{};
                 auto previousWrittenBytes = current.storageMonitoring
@@ -385,6 +400,12 @@ private:
                 double maxPollGapMs = 0;
                 double maxWriterCallMs = 0;
                 double writerTimeMs = 0;
+                std::optional<std::int64_t> firstEventTimestampUs;
+                quint64 eventSecondBin = 0, eventSecondCount = 0;
+                std::optional<std::int64_t> lagBaselineTimestampUs;
+                std::optional<std::int64_t> lagLastTimestampUs;
+                std::chrono::steady_clock::time_point lagBaselineHost;
+                std::optional<double> latestCaptureLagMs;
                 std::optional<double> lastDiskFreeMiB;
                 std::optional<std::uintmax_t> previousFileSize;
                 fs::path blockStatsFile;
@@ -408,7 +429,8 @@ private:
                         const auto cpuNow = std::clock();
                         if (cpuNow != static_cast<std::clock_t>(-1)
                             && previousCpuClock != static_cast<std::clock_t>(-1)) {
-                            processCpu = 100.0 * (cpuNow - previousCpuClock) / CLOCKS_PER_SEC / elapsed;
+                            processCpu = std::clamp(100.0 * (cpuNow - previousCpuClock)
+                                / CLOCKS_PER_SEC / elapsed / onlineCores, 0.0, 100.0);
                         }
                         previousCpuClock = cpuNow;
                         const auto systemNow = systemCpuTicks();
@@ -464,9 +486,10 @@ private:
                     const double triggerRate = session ? (session->triggers - previousTriggers) / elapsed : 0;
                     QStringList summary;
                     if (current.performanceMonitoring) {
-                        summary << QString("Events %1/s | CPU %2% | Loop max %3 ms | RSS %4 MiB")
-                            .arg(QString::number(eventRate, 'f', 0))
-                            .arg(processCpu ? QString::number(*processCpu, 'f', 0) : "n/a")
+                        summary << QString("Recorded events: %1/s | Pi CPU used by app: %2%")
+                            .arg(groupedCount(static_cast<quint64>(std::llround(eventRate))))
+                            .arg(processCpu ? QString::number(*processCpu, 'f', 0) : "n/a");
+                        summary << QString("Longest gap between capture checks: %1 ms | App RAM: %2 MiB")
                             .arg(QString::number(maxPollGapMs, 'f', 1))
                             .arg(rssMiB ? QString::number(*rssMiB, 'f', 0) : "n/a");
                     }
@@ -476,16 +499,19 @@ private:
                             : "Temperature unavailable");
                     }
                     if (current.storageMonitoring) {
-                        summary << QString("Storage file %1 MiB/s | device %2 MiB/s | busy %3% | writer max %4 ms")
+                        summary << QString("AEDAT file growth: %1 MiB/s | SD/SSD writes: %2 MiB/s | device busy: %3%")
                             .arg(fileMiBs ? QString::number(*fileMiBs, 'f', 1) : "n/a")
                             .arg(deviceWriteMiBs ? QString::number(*deviceWriteMiBs, 'f', 1) : "n/a")
-                            .arg(deviceBusyPercent ? QString::number(*deviceBusyPercent, 'f', 0) : "n/a")
-                            .arg(QString::number(maxWriterCallMs, 'f', 1));
+                            .arg(deviceBusyPercent ? QString::number(*deviceBusyPercent, 'f', 0) : "n/a");
+                        summary << QString("Slowest AEDAT write: %1 ms | Relative capture lag: %2 ms")
+                            .arg(QString::number(maxWriterCallMs, 'f', 1))
+                            .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a");
+                        summary << "Lost events: unavailable (total and per second)";
                     }
                     if (session && !session->monitorError.isEmpty()) {
                         summary << session->monitorError;
                     }
-                    emit monitoring(summary.join(" | "));
+                    emit monitoring(summary.join('\n'));
                     if (session && monitorLog) {
                         *monitorLog << utcNow().toStdString() << ','
                             << std::chrono::duration<double>(now - sessionStart).count() << ','
@@ -503,7 +529,10 @@ private:
                             << csvNumber(dirtyMiB) << ',' << csvNumber(writebackMiB) << ','
                             << csvNumber(ioPressure) << ',' << csvNumber(deviceWriteMiBs) << ','
                             << csvNumber(deviceBusyPercent) << ','
-                            << (session->finalizeMs ? csvNumber(*session->finalizeMs) : "") << '\n'
+                            << (session->finalizeMs ? csvNumber(*session->finalizeMs) : "") << ','
+                            << session->peakEventsPerSecond << ','
+                            << (current.storageMonitoring ? csvNumber(latestCaptureLagMs) : "")
+                            << ",,," << (current.storageMonitoring ? "unavailable" : "disabled") << '\n'
                             << std::flush;
                         if (!monitorLog->good()) {
                             session->monitorError = "Monitoring CSV write failed";
@@ -537,7 +566,8 @@ private:
                     }
                     const QString path = QString::fromStdString(session->file.string());
                     emit recordingState(false, state == "complete"
-                        ? QString("Saved %1").arg(path)
+                        ? QString("Saved %1 | Peak: %2 recorded events/s")
+                            .arg(path, groupedCount(session->peakEventsPerSecond))
                         : QString("Recording interrupted: %1 (%2)").arg(reason, path));
                     session.reset();
                 };
@@ -618,11 +648,14 @@ private:
                                 }
                                 else {
                                     *monitorLog << "utc,elapsed_s,events_total,triggers_total,event_rate_eps,"
-                                        "trigger_rate_hz,process_cpu_pct,system_cpu_pct,rss_mib,cpu_freq_mhz,"
-                                        "max_poll_gap_ms,temperature_c,free_disk_mib,file_growth_mib_s,"
-                                        "process_write_mib_s,max_writer_call_ms,writer_time_ms,dirty_mib,"
-                                        "writeback_mib,io_psi_some_avg10,device_write_mib_s,"
-                                        "device_io_busy_pct,writer_finalize_ms\n" << std::flush;
+                                        "trigger_rate_hz,app_cpu_pct_total_capacity,system_cpu_pct,"
+                                        "app_resident_ram_mib,cpu_freq_mhz,max_capture_loop_gap_ms,"
+                                        "temperature_c,free_disk_mib,aedat_file_growth_mib_s,"
+                                        "process_write_mib_s,slowest_aedat_write_ms,writer_time_ms,dirty_mib,"
+                                        "writeback_mib,io_psi_some_avg10,storage_device_write_mib_s,"
+                                        "device_io_busy_pct,writer_finalize_ms,peak_events_per_second,"
+                                        "relative_capture_lag_ms,lost_events_total,lost_events_per_s,"
+                                        "loss_count_status\n" << std::flush;
                                     if (!monitorLog->good()) {
                                         session->monitorError = "Cannot write monitoring CSV header";
                                         monitorLog.reset();
@@ -643,6 +676,11 @@ private:
                                 ? readBlockStats(blockStatsFile) : std::optional<BlockStats>{};
                             previousEvents = previousTriggers = 0;
                             maxPollGapMs = maxWriterCallMs = writerTimeMs = 0;
+                            firstEventTimestampUs.reset();
+                            eventSecondBin = eventSecondCount = 0;
+                            lagBaselineTimestampUs.reset();
+                            lagLastTimestampUs.reset();
+                            latestCaptureLagMs.reset();
                             saveMetadata(*session, "recording");
                             emit statistics(0, 0);
                             emit recordingState(true, QString("Recording %1").arg(QString::fromStdString(output.filename().string())));
@@ -666,12 +704,44 @@ private:
                                     std::chrono::steady_clock::now() - beforeWrite).count();
                                 maxWriterCallMs = std::max(maxWriterCallMs, millis);
                                 writerTimeMs += millis;
+                                const auto latestTimestampUs = events->getHighestTime();
+                                const auto arrival = std::chrono::steady_clock::now();
+                                if (!lagBaselineTimestampUs || (lagLastTimestampUs
+                                    && latestTimestampUs < *lagLastTimestampUs)) {
+                                    lagBaselineTimestampUs = latestTimestampUs;
+                                    lagBaselineHost = arrival;
+                                    latestCaptureLagMs = 0;
+                                }
+                                else {
+                                    latestCaptureLagMs = std::max(0.0,
+                                        std::chrono::duration<double, std::milli>(arrival - lagBaselineHost).count()
+                                        - (latestTimestampUs - *lagBaselineTimestampUs) / 1000.0);
+                                }
+                                lagLastTimestampUs = latestTimestampUs;
+                                session->maxCaptureLagMs = std::max(
+                                    session->maxCaptureLagMs.value_or(0.0), *latestCaptureLagMs);
                             }
                         }
                         // Only the display is sampled; the recorded stream is never sampled.
                         const size_t stride = std::max<size_t>(1, events->size() / 12000);
                         size_t position = 0;
                         for (const auto &event : *events) {
+                            if (writer) {
+                                const auto timestampUs = event.timestamp();
+                                if (!firstEventTimestampUs || timestampUs < *firstEventTimestampUs) {
+                                    firstEventTimestampUs = timestampUs;
+                                    eventSecondBin = 0;
+                                    eventSecondCount = 0;
+                                }
+                                const auto bin = static_cast<quint64>(
+                                    (timestampUs - *firstEventTimestampUs) / 1'000'000);
+                                if (bin != eventSecondBin) {
+                                    eventSecondBin = bin;
+                                    eventSecondCount = 0;
+                                }
+                                session->peakEventsPerSecond = std::max(
+                                    session->peakEventsPerSecond, ++eventSecondCount);
+                            }
                             if (position++ % stride != 0) {
                                 continue;
                             }
@@ -914,7 +984,8 @@ public:
             updateButtons();
         });
         connect(&recorder_, &Recorder::statistics, this, [this](quint64 events, quint64 triggers) {
-            counts_->setText(QString("Events: %1 | Triggers: %2").arg(events).arg(triggers));
+            counts_->setText(QString("Events: %1 | Triggers: %2")
+                .arg(groupedCount(events), groupedCount(triggers)));
         });
         connect(&recorder_, &Recorder::monitoring, this, [this](const QString &message) {
             monitorStatus_->setText(message);
