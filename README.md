@@ -45,7 +45,7 @@ The Settings page has three independent checkboxes, changeable only between reco
 | Option | Live display and `.aedat4.monitor.csv` fields |
 | --- | --- |
 | Performance | Received event and trigger rates, process CPU usage across all application threads (it may exceed 100% on a multicore Pi), whole-system CPU usage, process resident memory, CPU frequency, and maximum time between capture-loop starts. |
-| Temperature | Pi SoC temperature from `/sys/class/thermal/thermal_zone0/temp`. A blank CSV value or “unavailable” means that path could not be read. |
+| Temperature | Pi SoC temperature from `/sys/class/thermal/thermal_zone0/temp`. A blank CSV value or “unavailable” means that path could not be read. Treat it as a trend indicator; Raspberry Pi recommends `vcgencmd measure_temp` for an accurate instantaneous reading. |
 | Storage | AEDAT4 file growth, process write rate from `/proc/self/io`, block-device write rate and I/O busy time from Linux sysfs, longest and total writer-call time, writer finalization time, free filesystem space, system-wide dirty and writeback memory, and system-wide I/O pressure `some avg10`. The recording JSON identifies the filesystem’s block device when Linux exposes it, such as `mmcblk0p2` or `nvme0n1p1`. |
 
 Enabled options are sampled approximately once per second by the existing camera worker. They do not create another thread or pin work to a core. The GUI retains its normal Qt thread. If any monitoring option is enabled, the app saves a `.aedat4.monitor.csv` next to the recording, and its `.aedat4.json` records the selected options, storage device, final file size, and any monitoring-file error. A CSV error does not stop event recording.
