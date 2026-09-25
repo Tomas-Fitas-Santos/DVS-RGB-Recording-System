@@ -5,6 +5,7 @@
 #include <QCheckBox>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -14,6 +15,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMap>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPixmap>
@@ -24,8 +26,10 @@
 #include <QStringList>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QTextStream>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWidget>
 
 #include <algorithm>
@@ -312,10 +316,13 @@ private:
         Settings settings;
         QString cameraName;
         QString startUtc;
+        QString endUtc;
         quint64 events = 0;
         quint64 triggers = 0;
         fs::path monitorFile;
         QString monitorError;
+        fs::path reportFile;
+        QString reportError;
         std::string storageDeviceName;
         std::optional<double> finalizeMs;
         quint64 peakEventsPerSecond = 0;
@@ -328,7 +335,7 @@ private:
             {"camera", session.cameraName},
             {"recording_state", state},
             {"start_utc", session.startUtc},
-            {"end_utc", state == "recording" ? QString{} : utcNow()},
+            {"end_utc", state == "recording" ? QString{} : session.endUtc},
             {"event_count", static_cast<qint64>(session.events)},
             {"trigger_count", static_cast<qint64>(session.triggers)},
             {"contrast_on", session.settings.contrastOn},
@@ -348,6 +355,9 @@ private:
             {"monitor_csv", session.monitorFile.empty()
                 ? QString{} : QString::fromStdString(session.monitorFile.filename().string())},
             {"monitor_error", session.monitorError},
+            {"report_md", session.reportFile.empty()
+                ? QString{} : QString::fromStdString(session.reportFile.filename().string())},
+            {"report_error", session.reportError},
             {"error", error}
         };
         const QString sidecar = QString::fromStdString(session.file.string()) + ".json";
@@ -358,6 +368,204 @@ private:
         const QByteArray bytes = QJsonDocument(json).toJson(QJsonDocument::Indented);
         if (file.write(bytes) != bytes.size() || !file.commit()) {
             throw std::runtime_error("Cannot save recording metadata file");
+        }
+    }
+
+    static void saveReport(const Session &session, const QString &state, const QString &reason = {}) {
+        struct MetricAggregate {
+            quint64 samples = 0;
+            double minimum = 0, maximum = 0, sum = 0;
+
+            void add(double value) {
+                if (samples == 0) minimum = maximum = value;
+                else {
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                }
+                ++samples;
+                sum += value;
+            }
+        };
+        static const QMap<QString, QString> labels{
+            {"elapsed_s", "Elapsed time (s)"},
+            {"events_total", "Recorded events, cumulative"},
+            {"triggers_total", "Recorded triggers, cumulative"},
+            {"event_rate_eps", "Recorded events per host second"},
+            {"trigger_rate_hz", "Recorded triggers per host second"},
+            {"app_cpu_pct_total_capacity", "App CPU (% of all online cores)"},
+            {"system_cpu_pct", "Whole Pi CPU (%)"},
+            {"app_resident_ram_mib", "App RAM resident (MiB)"},
+            {"cpu_freq_mhz", "CPU 0 frequency (MHz)"},
+            {"max_capture_loop_gap_ms", "Longest capture-loop gap (ms)"},
+            {"temperature_c", "Pi SoC temperature (C)"},
+            {"free_disk_mib", "Free space on output filesystem (MiB)"},
+            {"aedat_file_growth_mib_s", "AEDAT4 file growth (MiB/s)"},
+            {"process_write_mib_s", "App write bytes charged by Linux (MiB/s)"},
+            {"slowest_aedat_write_ms", "Slowest AEDAT4 writer call (ms)"},
+            {"writer_time_ms", "Time in AEDAT4 writer calls per sample (ms)"},
+            {"dirty_mib", "System dirty memory (MiB)"},
+            {"writeback_mib", "System writeback memory (MiB)"},
+            {"io_psi_some_avg10", "System I/O pressure, some avg10 (%)"},
+            {"storage_device_write_mib_s", "Storage-device completed writes (MiB/s)"},
+            {"device_io_busy_pct", "Storage-device busy time (%)"},
+            {"writer_finalize_ms", "AEDAT4 writer finalization (ms)"},
+            {"peak_events_per_second", "Peak recorded events in a camera-timestamp second"},
+            {"relative_capture_lag_ms", "Relative capture lag (ms)"},
+            {"lost_events_total", "Lost events, cumulative"},
+            {"lost_events_per_s", "Lost events per second"}
+        };
+
+        QStringList columns;
+        QVector<MetricAggregate> aggregates;
+        quint64 sampleRows = 0;
+        QString firstSampleUtc, lastSampleUtc, csvReadError;
+        QStringList peakSampleValues;
+        double peakSampleRate = -1;
+        if (!session.monitorFile.empty()) {
+            QFile csv(QString::fromStdString(session.monitorFile.string()));
+            if (!csv.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                csvReadError = "Could not read monitoring CSV: " + csv.errorString();
+            }
+            else {
+                QTextStream input(&csv);
+                columns = input.readLine().split(',', Qt::KeepEmptyParts);
+                if (columns.size() < 2 || columns.front() != "utc") {
+                    csvReadError = "Monitoring CSV header is missing or invalid";
+                    columns.clear();
+                }
+                else {
+                    aggregates.resize(columns.size());
+                    const qsizetype rateColumn = columns.indexOf("event_rate_eps");
+                    while (!input.atEnd()) {
+                        const QStringList values = input.readLine().split(',', Qt::KeepEmptyParts);
+                        if (values.size() != columns.size()) continue;
+                        if (firstSampleUtc.isEmpty()) firstSampleUtc = values.front();
+                        lastSampleUtc = values.front();
+                        ++sampleRows;
+                        for (qsizetype index = 1; index < columns.size(); ++index) {
+                            bool valid = false;
+                            const double value = values.at(index).toDouble(&valid);
+                            if (valid && std::isfinite(value)) aggregates[index].add(value);
+                        }
+                        if (rateColumn >= 0) {
+                            bool valid = false;
+                            const double rate = values.at(rateColumn).toDouble(&valid);
+                            if (valid && std::isfinite(rate) && rate > peakSampleRate) {
+                                peakSampleRate = rate;
+                                peakSampleValues = values;
+                            }
+                        }
+                    }
+                    if (input.status() != QTextStream::Ok) {
+                        csvReadError = "Monitoring CSV read failed";
+                    }
+                }
+            }
+        }
+
+        QStringList report{
+            "# DVXplorer recording report", "",
+            QString("- Recording: `%1`").arg(QString::fromStdString(session.file.filename().string())),
+            QString("- Camera: %1").arg(session.cameraName),
+            QString("- Outcome: %1").arg(state),
+            QString("- Start (UTC): %1").arg(session.startUtc),
+            QString("- End (UTC): %1").arg(session.endUtc),
+            QString("- Report generated (UTC): %1").arg(utcNow()),
+            QString("- Recorded events: %1").arg(groupedCount(session.events)),
+            QString("- Recorded triggers: %1").arg(groupedCount(session.triggers)),
+            QString("- Peak recorded events in a one-second camera-timestamp bin: %1")
+                .arg(groupedCount(session.peakEventsPerSecond)),
+            QString("- AEDAT4 size: %1 bytes").arg(completedFileSize(session.file)),
+            QString("- Writer finalization: %1 ms").arg(session.finalizeMs
+                ? QString::number(*session.finalizeMs, 'f', 2) : "unavailable"),
+            QString("- Max relative capture lag: %1 ms").arg(session.maxCaptureLagMs
+                ? QString::number(*session.maxCaptureLagMs, 'f', 2) : "unavailable"),
+            QString("- Output device: %1").arg(session.storageDeviceName.empty()
+                ? "unavailable" : QString::fromStdString(session.storageDeviceName)),
+            QString("- ON/OFF contrast: %1 / %2").arg(session.settings.contrastOn)
+                .arg(session.settings.contrastOff),
+            QString("- Preview interval: %1 ms").arg(session.settings.previewIntervalMs),
+            QString("- Performance / temperature / storage monitoring: %1 / %2 / %3")
+                .arg(session.settings.performanceMonitoring ? "on" : "off")
+                .arg(session.settings.temperatureMonitoring ? "on" : "off")
+                .arg(session.settings.storageMonitoring ? "on" : "off")
+        };
+        if (!reason.isEmpty()) report << QString("- Interruption reason: %1").arg(reason);
+        if (!session.monitorError.isEmpty()) report << "- Monitoring error: " + session.monitorError;
+        report << "" << "## Monitoring samples" << "";
+        if (session.monitorFile.empty()) {
+            report << "No monitoring CSV was created (monitoring was disabled or CSV creation failed).";
+        }
+        else {
+            report << QString("- Full time series: `%1`")
+                .arg(QString::fromStdString(session.monitorFile.filename().string()))
+                << QString("- Valid sample rows: %1").arg(sampleRows);
+            if (!firstSampleUtc.isEmpty()) {
+                report << QString("- First/last sample (UTC): %1 / %2")
+                    .arg(firstSampleUtc, lastSampleUtc);
+            }
+            if (!csvReadError.isEmpty()) report << "- CSV read error: " + csvReadError;
+        }
+        if (!columns.isEmpty()) {
+            report << "" << "| Metric | Samples | Minimum | Mean | Maximum |"
+                << "| --- | ---: | ---: | ---: | ---: |";
+            for (qsizetype index = 1; index < columns.size(); ++index) {
+                if (columns.at(index) == "loss_count_status") continue;
+                const auto &value = aggregates.at(index);
+                const QString name = labels.value(columns.at(index), columns.at(index));
+                if (value.samples == 0) {
+                    report << QString("| %1 | 0 | unavailable | unavailable | unavailable |").arg(name);
+                }
+                else {
+                    report << QString("| %1 | %2 | %3 | %4 | %5 |")
+                        .arg(name).arg(value.samples)
+                        .arg(value.minimum, 0, 'f', 2)
+                        .arg(value.sum / value.samples, 0, 'f', 2)
+                        .arg(value.maximum, 0, 'f', 2);
+                }
+            }
+        }
+        report << "" << "## Peak event-intake interval" << "";
+        if (peakSampleValues.isEmpty()) {
+            report << "No monitoring interval with a measured event rate is available."
+                << "Enable at least one monitoring option to capture a same-interval metric snapshot.";
+        }
+        else {
+            report << QString("- Highest monitored intake: %1 recorded events/s")
+                    .arg(groupedCount(static_cast<quint64>(std::llround(peakSampleRate))))
+                << QString("- Sample time (UTC): %1").arg(peakSampleValues.front())
+                << "- This row contains metrics from the same approximately one-second host sampling interval."
+                << "- The camera-timestamp peak listed above uses a separate one-second bin and may differ."
+                << "" << "| Metric | Value during peak-intake interval |"
+                << "| --- | ---: |";
+            for (qsizetype index = 1; index < columns.size(); ++index) {
+                const QString name = labels.value(columns.at(index), columns.at(index));
+                QString value = peakSampleValues.at(index);
+                if (value.isEmpty()) {
+                    if (columns.at(index).startsWith("lost_events_"))
+                        value = "unavailable through camera interface";
+                    else if (columns.at(index) == "writer_finalize_ms")
+                        value = "only measured after recording stops";
+                    else
+                        value = "not recorded in this interval";
+                }
+                report << QString("| %1 | %2 |").arg(name, value);
+            }
+        }
+        report << "" << "## Interpretation" << ""
+            << "Lost-event totals and rates are unavailable through this recorder's camera interface; blank values do not mean zero loss."
+            << "File growth and Linux write counts can reflect buffering; device writes include other processes."
+            << "Relative capture lag is a change from the first event batch, not absolute sensor latency."
+            << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
+            << "";
+
+        QSaveFile output(QString::fromStdString(session.reportFile.string()));
+        if (!output.open(QIODevice::WriteOnly)) {
+            throw std::runtime_error("Cannot create recording report");
+        }
+        const QByteArray bytes = report.join('\n').toUtf8();
+        if (output.write(bytes) != bytes.size() || !output.commit()) {
+            throw std::runtime_error("Cannot save recording report");
         }
     }
 
@@ -421,6 +629,7 @@ private:
                     if (elapsed <= 0 || (!finalSample && elapsed < 1.0)) {
                         return;
                     }
+                    const bool shortFinalSample = finalSample && elapsed < 0.5;
                     std::optional<double> processCpu, systemCpu, rssMiB, writeMiBs, frequencyMHz;
                     std::optional<double> fileMiBs, dirtyMiB, writebackMiB, ioPressure;
                     std::optional<double> deviceWriteMiBs, deviceBusyPercent;
@@ -482,12 +691,22 @@ private:
                     if (current.temperatureMonitoring) {
                         temperatureC = readNumber("/sys/class/thermal/thermal_zone0/temp", 1000.0);
                     }
-                    const double eventRate = session ? (session->events - previousEvents) / elapsed : 0;
-                    const double triggerRate = session ? (session->triggers - previousTriggers) / elapsed : 0;
+                    if (shortFinalSample) {
+                        processCpu.reset();
+                        systemCpu.reset();
+                        fileMiBs.reset();
+                        writeMiBs.reset();
+                        deviceWriteMiBs.reset();
+                        deviceBusyPercent.reset();
+                    }
+                    const std::optional<double> eventRate = shortFinalSample ? std::nullopt
+                        : std::optional<double>(session ? (session->events - previousEvents) / elapsed : 0);
+                    const std::optional<double> triggerRate = shortFinalSample ? std::nullopt
+                        : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
                     QStringList summary;
                     if (current.performanceMonitoring) {
                         summary << QString("Recorded events: %1/s | Pi CPU used by app: %2%")
-                            .arg(groupedCount(static_cast<quint64>(std::llround(eventRate))))
+                            .arg(eventRate ? groupedCount(static_cast<quint64>(std::llround(*eventRate))) : "n/a")
                             .arg(processCpu ? QString::number(*processCpu, 'f', 0) : "n/a");
                         summary << QString("Longest gap between capture checks: %1 ms | App RAM: %2 MiB")
                             .arg(QString::number(maxPollGapMs, 'f', 1))
@@ -516,8 +735,7 @@ private:
                         *monitorLog << utcNow().toStdString() << ','
                             << std::chrono::duration<double>(now - sessionStart).count() << ','
                             << session->events << ',' << session->triggers << ','
-                            << (current.performanceMonitoring ? csvNumber(eventRate) : "") << ','
-                            << (current.performanceMonitoring ? csvNumber(triggerRate) : "") << ','
+                            << csvNumber(eventRate) << ',' << csvNumber(triggerRate) << ','
                             << csvNumber(processCpu) << ',' << csvNumber(systemCpu) << ','
                             << csvNumber(rssMiB) << ',' << csvNumber(frequencyMHz) << ','
                             << (current.performanceMonitoring ? csvNumber(maxPollGapMs) : "") << ','
@@ -554,10 +772,18 @@ private:
                     }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     writer.reset(); // AEDAT4 index and buffered packets are finalized here.
+                    session->endUtc = utcNow();
                     session->finalizeMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - beforeFinalize).count();
                     sampleMonitor(std::chrono::steady_clock::now(), true);
                     monitorLog.reset();
+                    try {
+                        saveReport(*session, state, reason);
+                    }
+                    catch (const std::exception &e) {
+                        session->reportError = QString::fromUtf8(e.what());
+                        session->reportFile.clear();
+                    }
                     try {
                         saveMetadata(*session, state, reason);
                     }
@@ -566,8 +792,9 @@ private:
                     }
                     const QString path = QString::fromStdString(session->file.string());
                     emit recordingState(false, state == "complete"
-                        ? QString("Saved %1 | Peak: %2 recorded events/s")
-                            .arg(path, groupedCount(session->peakEventsPerSecond))
+                        ? QString("Saved %1 | Peak: %2 recorded events/s | Report: %3")
+                            .arg(path, groupedCount(session->peakEventsPerSecond),
+                                session->reportError.isEmpty() ? "saved" : session->reportError)
                         : QString("Recording interrupted: %1 (%2)").arg(reason, path));
                     session.reset();
                 };
@@ -625,12 +852,14 @@ private:
                                     + (index ? "_" + QString::number(index) : QString{}) + ".aedat4";
                                 output = directory / nativePath(name);
                                 if (!fs::exists(output) && !fs::exists(output.string() + ".json")
-                                    && !fs::exists(output.string() + ".monitor.csv")) {
+                                    && !fs::exists(output.string() + ".monitor.csv")
+                                    && !fs::exists(output.string() + ".report.md")) {
                                     break;
                                 }
                             }
                             writer.emplace(output.string(), camera);
                             session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
+                            session->reportFile = fs::path(output.string() + ".report.md");
                             if (current.performanceMonitoring || current.temperatureMonitoring
                                 || current.storageMonitoring) {
                                 session->monitorFile = fs::path(output.string() + ".monitor.csv");
@@ -809,16 +1038,26 @@ private:
                 if (writer && session) {
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     writer.reset();
+                    session->endUtc = utcNow();
                     session->finalizeMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - beforeFinalize).count();
                     monitorLog.reset();
+                    try {
+                        saveReport(*session, "interrupted", error);
+                    }
+                    catch (const std::exception &reportFailure) {
+                        session->reportError = QString::fromUtf8(reportFailure.what());
+                        session->reportFile.clear();
+                    }
                     try {
                         saveMetadata(*session, "interrupted", error);
                     }
                     catch (...) {
                         // Keep the original capture/write error visible.
                     }
-                    emit recordingState(false, "Recording interrupted: " + error);
+                    const QString reportStatus = session->reportError.isEmpty()
+                        ? QString(" | Report saved") : QString(" | Report: ") + session->reportError;
+                    emit recordingState(false, "Recording interrupted: " + error + reportStatus);
                 }
                 emit cameraStatus("Camera error: " + error + "; retrying", false);
             }
