@@ -43,12 +43,36 @@ std::string cameraString(GX_DEV_HANDLE device, const char *feature) {
     check(GXGetStringValue(device, feature, &value), feature);
     return value.strCurValue;
 }
+
+RgbRecorder::Preview thumbnailBayerRG8(const char *bayer, uint32_t width, uint32_t height) {
+    RgbRecorder::Preview preview;
+    preview.width = std::min<uint32_t>(640, width / 2);
+    preview.height = std::min<uint32_t>(480, height / 2);
+    if (!preview.width || !preview.height) return preview;
+    preview.rgb.resize(size_t(preview.width) * preview.height * 3);
+    const auto *pixels = reinterpret_cast<const uint8_t *>(bayer);
+    for (uint32_t y = 0; y < preview.height; ++y) {
+        const uint32_t sourceY = (y * (height / 2) / preview.height) * 2;
+        for (uint32_t x = 0; x < preview.width; ++x) {
+            const uint32_t sourceX = (x * (width / 2) / preview.width) * 2;
+            const size_t source = size_t(sourceY) * width + sourceX;
+            const size_t dest = (size_t(y) * preview.width + x) * 3;
+            preview.rgb[dest] = pixels[source];
+            preview.rgb[dest + 1] = static_cast<uint8_t>((unsigned(pixels[source + 1])
+                + unsigned(pixels[source + width])) / 2);
+            preview.rgb[dest + 2] = pixels[source + width + 1];
+        }
+    }
+    return preview;
+}
 } // namespace
 
-RgbRecorder::RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial)
+RgbRecorder::RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial,
+    PreviewCallback previewCallback, bool previewOnly)
     : rawPath_(aedatPath.string() + ".rgb.raw"),
       indexPath_(aedatPath.string() + ".rgb.frames.csv"),
-      requestedSerial_(std::move(requestedSerial)) {}
+      requestedSerial_(std::move(requestedSerial)),
+      previewCallback_(std::move(previewCallback)), previewOnly_(previewOnly) {}
 
 RgbRecorder::~RgbRecorder() {
     stop();
@@ -110,16 +134,18 @@ void RgbRecorder::start() {
         }
         summary_.width = static_cast<uint32_t>(width.nCurValue);
         summary_.height = static_cast<uint32_t>(height.nCurValue);
-        raw_.open(rawPath_, std::ios::binary | std::ios::trunc);
-        index_.open(indexPath_, std::ios::trunc);
-        if (!raw_ || !index_) throw std::runtime_error("Cannot create RGB raw/index files");
-        index_ << "frame_index,frame_id,camera_timestamp_ticks,host_utc,host_steady_ns,byte_offset,bytes,width,height,pixel_format\n";
-        if (!index_) throw std::runtime_error("Cannot write RGB index header");
+        if (!previewOnly_) {
+            raw_.open(rawPath_, std::ios::binary | std::ios::trunc);
+            index_.open(indexPath_, std::ios::trunc);
+            if (!raw_ || !index_) throw std::runtime_error("Cannot create RGB raw/index files");
+            index_ << "frame_index,frame_id,camera_timestamp_ticks,host_utc,host_steady_ns,byte_offset,bytes,width,height,pixel_format\n";
+            if (!index_) throw std::runtime_error("Cannot write RGB index header");
+        }
         check(GXSetAcqusitionBufferNumber(device_, 16), "GXSetAcqusitionBufferNumber");
         check(GXStreamOn(device_), "GXStreamOn");
         streamOn_ = true;
         summary_.startUtc = utcNow();
-        writer_ = std::thread([this] { writeLoop(); });
+        if (!previewOnly_) writer_ = std::thread([this] { writeLoop(); });
         capture_ = std::thread([this] { captureLoop(); });
     }
     catch (...) {
@@ -144,6 +170,7 @@ void RgbRecorder::captureLoop() noexcept {
         std::vector<char> buffer(static_cast<size_t>(payload.nCurValue));
         uint64_t previousId = 0;
         bool havePreviousId = false;
+        auto lastPreview = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
         while (!stopping_) {
             GX_FRAME_DATA frame{};
             frame.pImgBuf = buffer.data();
@@ -162,30 +189,42 @@ void RgbRecorder::captureLoop() noexcept {
                 || static_cast<size_t>(frame.nImgSize) != size_t(summary_.width) * summary_.height) {
                 throw std::runtime_error("RGB frame format/size changed during capture");
             }
-            Frame item;
-            item.id = frame.nFrameID;
-            item.cameraTicks = frame.nTimestamp;
-            item.hostSteadyNs = steadyNs();
-            item.hostUtc = utcNow();
-            item.pixels.assign(buffer.begin(), buffer.begin() + frame.nImgSize);
-            bool overflow = false;
-            {
-                std::lock_guard lock(mutex_);
-                if (havePreviousId && frame.nFrameID > previousId + 1)
-                    summary_.missingFrameIds += frame.nFrameID - previousId - 1;
-                previousId = frame.nFrameID;
-                havePreviousId = true;
-                if (queue_.size() == 16) {
-                    ++summary_.queueOverflows;
-                    overflow = true;
+            bool previewAllowed = previewOnly_;
+            if (!previewOnly_) {
+                Frame item;
+                item.id = frame.nFrameID;
+                item.cameraTicks = frame.nTimestamp;
+                item.hostSteadyNs = steadyNs();
+                item.hostUtc = utcNow();
+                item.pixels.assign(buffer.begin(), buffer.begin() + frame.nImgSize);
+                bool overflow = false;
+                {
+                    std::lock_guard lock(mutex_);
+                    if (havePreviousId && frame.nFrameID > previousId + 1)
+                        summary_.missingFrameIds += frame.nFrameID - previousId - 1;
+                    previousId = frame.nFrameID;
+                    havePreviousId = true;
+                    if (queue_.size() == 16) {
+                        ++summary_.queueOverflows;
+                        overflow = true;
+                    }
+                    else {
+                        queue_.push_back(std::move(item));
+                        previewAllowed = queue_.size() <= 4;
+                    }
                 }
-                else queue_.push_back(std::move(item));
+                if (overflow) {
+                    fail("RGB writer queue full: storage cannot keep up with camera");
+                    break;
+                }
+                ready_.notify_one();
             }
-            if (overflow) {
-                fail("RGB writer queue full: storage cannot keep up with camera");
-                break;
+            const auto now = std::chrono::steady_clock::now();
+            if (previewAllowed && previewCallback_
+                && now - lastPreview >= std::chrono::milliseconds(100)) {
+                previewCallback_(thumbnailBayerRG8(buffer.data(), summary_.width, summary_.height));
+                lastPreview = now;
             }
-            ready_.notify_one();
         }
     }
     catch (const std::exception &e) { fail(e.what()); }
