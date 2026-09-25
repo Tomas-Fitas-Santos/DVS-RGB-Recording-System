@@ -495,7 +495,7 @@ private:
         }
 
         QStringList report{
-            "# DVXplorer recording report", "",
+            "# DVXplorer + Daheng recording report", "",
             QString("- Recording: `%1`").arg(QString::fromStdString(session.file.filename().string())),
             QString("- Camera: %1").arg(session.cameraName),
             QString("- Outcome: %1").arg(state),
@@ -749,9 +749,11 @@ private:
                     const std::optional<double> triggerRate = shortFinalSample ? std::nullopt
                         : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
                     const auto rgbNow = rgb ? rgb->snapshot() : (session ? session->rgb : RgbRecorder::Summary{});
-                    const std::optional<double> rgbRate = shortFinalSample ? std::nullopt
+                    const std::optional<double> rgbRate = shortFinalSample || !session
+                        || rgbNow.frames < previousRgbFrames ? std::nullopt
                         : std::optional<double>((rgbNow.frames - previousRgbFrames) / elapsed);
-                    const std::optional<double> rgbMiBs = shortFinalSample ? std::nullopt
+                    const std::optional<double> rgbMiBs = shortFinalSample || !session
+                        || rgbNow.bytes < previousRgbBytes ? std::nullopt
                         : std::optional<double>((rgbNow.bytes - previousRgbBytes)
                             / (1024.0 * 1024.0) / elapsed);
                     QStringList summary;
@@ -820,8 +822,8 @@ private:
                     }
                     previousEvents = session ? session->events : 0;
                     previousTriggers = session ? session->triggers : 0;
-                    previousRgbFrames = rgbNow.frames;
-                    previousRgbBytes = rgbNow.bytes;
+                    previousRgbFrames = session ? rgbNow.frames : 0;
+                    previousRgbBytes = session ? rgbNow.bytes : 0;
                     maxPollGapMs = 0;
                     maxWriterCallMs = 0;
                     writerTimeMs = 0;
