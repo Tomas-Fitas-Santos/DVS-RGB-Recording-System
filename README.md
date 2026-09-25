@@ -44,11 +44,26 @@ The Settings page has three independent checkboxes, changeable only between reco
 
 | Option | Live display and `.aedat4.monitor.csv` fields |
 | --- | --- |
-| Performance | Received event and trigger rates, process CPU usage across all application threads (it may exceed 100% on a multicore Pi), whole-system CPU usage, process resident memory, CPU frequency, and maximum time between capture-loop starts. |
+| Performance | Received event and trigger rates, application CPU use normalized to all online cores (100% means the entire Pi CPU capacity), whole-system CPU usage, application RAM, CPU frequency, and the longest interval between capture-loop starts. Event counts on screen use commas every three digits. |
 | Temperature | Pi SoC temperature from `/sys/class/thermal/thermal_zone0/temp`. A blank CSV value or “unavailable” means that path could not be read. Treat it as a trend indicator; Raspberry Pi recommends `vcgencmd measure_temp` for an accurate instantaneous reading. |
-| Storage | AEDAT4 file growth, process write rate from `/proc/self/io`, block-device write rate and I/O busy time from Linux sysfs, longest and total writer-call time, writer finalization time, free filesystem space, system-wide dirty and writeback memory, and system-wide I/O pressure `some avg10`. The recording JSON identifies the filesystem’s block device when Linux exposes it, such as `mmcblk0p2` or `nvme0n1p1`. |
+| Storage | AEDAT4 file growth, process write rate from `/proc/self/io`, block-device write rate and I/O busy time from Linux sysfs, longest and total writer-call time, relative capture lag, writer finalization time, free filesystem space, system-wide dirty and writeback memory, and system-wide I/O pressure `some avg10`. The recording JSON identifies the filesystem’s block device when Linux exposes it, such as `mmcblk0p2` or `nvme0n1p1`. |
 
 Enabled options are sampled approximately once per second by the existing camera worker. They do not create another thread or pin work to a core. The GUI retains its normal Qt thread. If any monitoring option is enabled, the app saves a `.aedat4.monitor.csv` next to the recording, and its `.aedat4.json` records the selected options, storage device, final file size, and any monitoring-file error. A CSV error does not stop event recording.
+
+The **Saved** message and JSON include the peak number of recorded events in any one-second camera-timestamp bin. This is measured while recording even if monitoring is off. The live event-rate display instead divides events received since the last monitoring sample by its actual elapsed time.
+
+The live labels mean:
+
+| Label | What it measures |
+| --- | --- |
+| App RAM (formerly RSS) | Physical RAM pages resident for this recorder process, in MiB. |
+| AEDAT file growth | Change in the visible `.aedat4` file size per elapsed second. The writer or Linux may buffer data, so it is not the SD card's actual physical write speed. |
+| SD/SSD writes | Completed sector writes per elapsed second on the block device containing the output folder; it includes other applications writing to that partition. It can be unavailable on non-block filesystems. |
+| Longest gap between capture checks (formerly loop max) | Largest time between starts of successive capture-loop passes during the last sampling interval, including time spent writing and rendering the preview. It is not an event-loss count. |
+| Slowest AEDAT write (formerly writer max) | Longest individual AEDAT writer call for one event batch or trigger batch during the interval. It includes encoding and buffering and does not mean the data was physically flushed to storage. |
+| Relative capture lag | Additional delay in receiving the newest camera timestamp relative to the first recorded event batch. It can increase while the worker is blocked, but is not an absolute camera-to-host latency measurement. A camera timestamp reset restarts the baseline. |
+
+**Lost events:** The app shows `unavailable` for accumulated lost events and lost events per second, and leaves the CSV numeric fields empty (`loss_count_status=unavailable`). A displayed zero would incorrectly imply proof of no loss. The DVXplorer has a device-side USB-buffer drop counter, but the public camera interface used by this recorder does not expose a complete event-loss count. Host queues can also drop packets, and sensor-side losses cannot always be counted. The JSON sets `event_loss_count_available=false`. Treat write stalls and growing relative capture lag as warning signs, not as a measured number of missing events. [iniVation describes the distinct loss locations](https://docs.inivation.com/help/faq.html#can-events-be-lost) and [the DVXplorer API lists its device counters](https://dv-processing.inivation.com/master/api.html).
 
 To compare SD card and SSD, collect several minutes of recordings with comparable scenes and settings. Compare sustained file growth, process write rate, and block-device write rate against event rate, and look for writer-call spikes, capture-loop delays, growing dirty data, I/O pressure, declining free space, and temperature alongside CPU frequency. Linux can buffer writes in RAM; the process write count includes other files, block-device counters include other processes on that filesystem, and dirty memory and I/O pressure cover the whole system. These readings help locate a bottleneck but cannot alone prove zero sensor event loss.
 
