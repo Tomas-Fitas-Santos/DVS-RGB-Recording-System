@@ -5,6 +5,7 @@ This branch records **DVXplorer events and Daheng MER2-302-56U3C frames together
 ## What it does
 
 - Shows a live, polarity-colored event preview on the Pi display. This is an event visualization, not a conventional intensity image; a still scene may look black.
+- Shows a live color Daheng preview beside the DVXplorer view while idle and during recording. The RGB preview samples BayerRG8 frames at up to 10 Hz and reduces them to at most 640 × 480 with a simple 2 × 2 Bayer color conversion. It is for framing/focus checks; saved raw frames retain their original resolution and rate. Preview work is skipped if the RGB writer queue is under pressure.
 - Writes every received DVXplorer event with its camera timestamp to an `.aedat4` recording. The preview is sampled separately and is never used as the recording input.
 - Saves received Daheng frames in a matching `.aedat4.rgb.raw` file as uncompressed BayerRG8. An `.aedat4.rgb.frames.csv` index records frame ID, camera timestamp ticks, host UTC and monotonic receipt times, byte offset, and size for each frame. A bounded 16-frame queue separates RGB capture from disk writes. Queue overflow or RGB capture/write error interrupts the joint recording.
 - Shows RGB frame counts, missing frame IDs and incomplete frames live. The existing performance/temperature/storage monitoring includes RGB work in app CPU and process writes; the CSV and report track RGB frame rate, raw throughput and gap counts.
@@ -55,7 +56,7 @@ Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder aga
 
 1. Connect both cameras over USB 3 and the SSD to a blue Pi USB 3 port. The Pi 5 has two blue ports, so three USB 3 peripherals require a suitable **powered USB 3 hub** on the other port or another storage interface. They share USB bandwidth; test the chosen physical topology under real load.
 2. Open **Settings** while idle. Choose the SSD output directory, adjust contrast and preview interval, and select monitoring. If several Daheng cameras are attached, enter the intended RGB serial. Tap **Apply settings** and wait for the acknowledgement.
-3. Tap **Start recording**. The app requires the exact Daheng model, configures BayerRG8/free-running acquisition, and creates matching AEDAT4 and RGB raw/index files. Event, trigger and RGB counters update. **Settings** is disabled.
+3. Confirm both live previews are visible, then tap **Start recording**. The app briefly reopens the exact Daheng model for BayerRG8/free-running acquisition and creates matching AEDAT4 and RGB raw/index files. Event, trigger and RGB counters update. **Settings** is disabled.
 4. Tap **Stop recording** and wait for **Saved ...** before disconnecting power. The RGB queue drains and both files close; the AEDAT4 index finalizes and the app saves a report.
 5. Inspect the file with `dv-filestat -v /path/to/file.aedat4` or open it with `dv::io::MonoCameraRecording` / DV GUI. When testing the external trigger wiring, verify the file actually contains trigger events and that the count rises.
 
