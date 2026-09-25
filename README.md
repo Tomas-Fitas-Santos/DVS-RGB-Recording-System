@@ -40,6 +40,17 @@ cmake --build build -j2
 
 If `dv-processing` is not found, install its C++ development package or pass its installation prefix to CMake with `-DCMAKE_PREFIX_PATH=/path/to/prefix`. If your default compiler is too old, select a supported compiler before the first CMake configure, for example `-DCMAKE_CXX_COMPILER=g++-13` if GCC 13 is installed. Build in Release mode to reduce Pi CPU load. Pass `GALAXY_SDK_ROOT` even if `libgxiapi.so` is under `/usr/lib`: the supplied installer does not copy C headers to a standard include path.
 
+### Pi 5 Galaxy library page-size compatibility
+
+If the executable fails before opening with `liblog4cplus_gx.so: ELF load command address/offset not page-aligned`, check `getconf PAGE_SIZE`. The supplied Galaxy ARM64 library has 4 KiB-aligned load segments and does not load under a 16 KiB page kernel. The Pi 5's default `kernel_2712.img` commonly uses 16 KiB pages. Ask Daheng for a 16 KiB-compatible SDK library if available. To run this supplied SDK with the Raspberry Pi OS 4 KiB kernel instead, first verify that `/boot/firmware/kernel8.img` exists, back up `/boot/firmware/config.txt`, and add this at the **end** of that file:
+
+```ini
+[pi5]
+kernel=kernel8.img
+```
+
+Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder again. The 4 KiB kernel has different Pi 5 optimizations; repeat capture/storage/thermal measurements under the kernel actually used for field recording. If `getconf PAGE_SIZE` already reports `4096`, investigate the installed shared library rather than changing the kernel.
+
 ## Field use
 
 1. Connect both cameras over USB 3 and the SSD to a blue Pi USB 3 port. The Pi 5 has two blue ports, so three USB 3 peripherals require a suitable **powered USB 3 hub** on the other port or another storage interface. They share USB bandwidth; test the chosen physical topology under real load.
