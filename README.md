@@ -111,6 +111,12 @@ The preview remains on the Pi screen, and the recording uses the settings last a
 
 The RGB raw file is tightly packed BayerRG8: each frame has exactly `width × height` bytes with no per-frame header. Use `byte_offset` and `bytes` in the CSV to read a frame, then demosaic BayerRG8 in analysis. The JSON reports resolution, serial, frame count and errors. At full 2048 × 1536 and 56 fps, RGB alone produces about **168 MiB/s** of raw image data (plus DV events). Check the combined SSD throughput and RGB gap/queue-overflow counts. Zero frame-ID gaps cannot prove the sensor itself never missed a frame.
 
+### If the Daheng preview is unavailable
+
+The app reports whether Galaxy enumerated zero devices, found a different model or serial, or detected the intended camera but could not open it. You can read the full status in the RGB panel or with `bash scripts/recorder.sh logs`. Discovery retries every 10 seconds on a separate task so a one-second Galaxy enumeration timeout does not stall the DVXplorer capture loop.
+
+With the app stopped, run `lsusb` and `lsusb -t` on the Pi. Confirm that the Daheng camera is physically listed and attached over USB 3 (`5000M`) through a blue port or a suitable powered USB 3 hub. The Galaxy SDK installer says to unplug and reconnect USB3 cameras after installation; do that if the app reports zero devices. If USB lists the camera but Galaxy still finds none, inspect the SDK's udev permissions for the `birds` user. If the app detects the exact model and serial but cannot open it, close GalaxyView or any other application that has the camera open and check the reported Galaxy status. A nonmatching serial entered in Settings also prevents selection. Keep the full status text when reporting the problem; "not found" alone cannot distinguish these cases.
+
 **Synchronization:** Daheng camera timestamps are native ticks and DVXplorer event/trigger timestamps are native microseconds; their epochs and units are not interchangeable. Host UTC times provide approximate ordering, not precise exposure-to-event alignment. For precise alignment, wire a camera exposure/trigger signal to the DVXplorer external trigger input, verify electrical compatibility, and validate edges against RGB frame IDs in a real test. The app records DVXplorer trigger events but does not generate pulses or assume a fixed clock offset.
 
 ## Recording diagnostics
