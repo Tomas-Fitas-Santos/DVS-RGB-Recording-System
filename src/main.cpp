@@ -291,6 +291,10 @@ public:
         previewSelection_ = rgb;
     }
 
+    void setEventPreviewWindowMs(int millis) {
+        eventPreviewWindowUs_.store(millis * 1000, std::memory_order_relaxed);
+    }
+
     bool takePreview(QImage &image) {
         QMutexLocker lock(&previewMutex_);
         if (latestPreview_.isNull()) {
@@ -697,7 +701,10 @@ private:
             try {
                 std::unique_ptr<dv::io::camera::DVXplorer> camera;
                 int eventWidth = 0, eventHeight = 0;
-                QImage preview;
+                std::vector<std::int64_t> eventPreviewTimes;
+                std::vector<std::uint8_t> eventPreviewPolarities;
+                std::optional<std::int64_t> newestPreviewTimestampUs;
+                std::chrono::steady_clock::time_point lastPreviewEventArrival;
                 auto connectCamera = [&](const Settings &settings) {
                     auto candidate = std::make_unique<dv::io::camera::DVXplorer>();
                     configure(*candidate, settings);
@@ -707,8 +714,10 @@ private:
                     eventWidth = resolution->width;
                     eventHeight = resolution->height;
                     if (previewEnabled_) {
-                        preview = QImage(eventWidth, eventHeight, QImage::Format_RGB888);
-                        preview.fill(Qt::black);
+                        const auto pixels = size_t(eventWidth) * eventHeight;
+                        eventPreviewTimes.assign(pixels, std::numeric_limits<std::int64_t>::min());
+                        eventPreviewPolarities.assign(pixels, 0);
+                        newestPreviewTimestampUs.reset();
                     }
                     camera = std::move(candidate);
                     emit cameraStatus(QString("Ready: %1 (%2 x %3)")
@@ -1067,6 +1076,11 @@ private:
                         const bool selected = *commands.previewRgb;
                         if ((selected && current.recordRgb) || (!selected && current.recordEvents)) {
                             previewRgb = selected;
+                            if (!previewRgb && previewEnabled_) {
+                                std::fill(eventPreviewTimes.begin(), eventPreviewTimes.end(),
+                                    std::numeric_limits<std::int64_t>::min());
+                                newestPreviewTimestampUs.reset();
+                            }
                             if (!previewRgb) {
                                 if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                                 rgbPreview.reset();
@@ -1263,6 +1277,15 @@ private:
                         // Camera-timestamp peak counting remains active without a display.
                         const size_t stride = previewEnabled_ && !previewRgb
                             ? std::max<size_t>(1, events->size() / 12000) : 0;
+                        if (stride) {
+                            const auto highest = events->getHighestTime();
+                            if (newestPreviewTimestampUs && highest < *newestPreviewTimestampUs) {
+                                std::fill(eventPreviewTimes.begin(), eventPreviewTimes.end(),
+                                    std::numeric_limits<std::int64_t>::min());
+                            }
+                            newestPreviewTimestampUs = highest;
+                            lastPreviewEventArrival = std::chrono::steady_clock::now();
+                        }
                         size_t position = 0;
                         for (const auto &event : *events) {
                             if (writer) {
@@ -1287,12 +1310,10 @@ private:
                             }
                             if (event.x() >= 0 && event.y() >= 0 && event.x() < eventWidth
                                 && event.y() < eventHeight) {
-                                auto *pixel = preview.scanLine(event.y()) + event.x() * 3;
-                                if (event.polarity()) {
-                                    pixel[0] = 30; pixel[1] = 205; pixel[2] = 255;
-                                }
-                                else {
-                                    pixel[0] = 255; pixel[1] = 100; pixel[2] = 160;
+                                const size_t pixel = size_t(event.y()) * eventWidth + event.x();
+                                if (event.timestamp() >= eventPreviewTimes[pixel]) {
+                                    eventPreviewTimes[pixel] = event.timestamp();
+                                    eventPreviewPolarities[pixel] = event.polarity();
                                 }
                             }
                         }
@@ -1318,12 +1339,32 @@ private:
                     const auto now = std::chrono::steady_clock::now();
                     if (camera && previewEnabled_ && !previewRgb
                         && now - lastPreview >= std::chrono::milliseconds(current.previewIntervalMs)) {
+                        QImage preview(eventWidth, eventHeight, QImage::Format_RGB888);
+                        preview.fill(Qt::black);
+                        // Render a short camera-timestamp window. The display interval can be
+                        // longer without smearing all motion between screen refreshes.
+                        if (newestPreviewTimestampUs && now - lastPreviewEventArrival < 100ms) {
+                            const auto windowUs = eventPreviewWindowUs_.load(std::memory_order_relaxed);
+                            const auto cutoff = *newestPreviewTimestampUs - windowUs;
+                            for (int y = 0; y < eventHeight; ++y) {
+                                auto *row = preview.scanLine(y);
+                                for (int x = 0; x < eventWidth; ++x) {
+                                    const size_t pixel = size_t(y) * eventWidth + x;
+                                    if (eventPreviewTimes[pixel] < cutoff) continue;
+                                    auto *color = row + x * 3;
+                                    if (eventPreviewPolarities[pixel]) {
+                                        color[0] = 30; color[1] = 205; color[2] = 255;
+                                    }
+                                    else {
+                                        color[0] = 255; color[1] = 100; color[2] = 160;
+                                    }
+                                }
+                            }
+                        }
                         {
                             QMutexLocker lock(&previewMutex_);
                             latestPreview_ = std::move(preview);
                         }
-                        preview = QImage(eventWidth, eventHeight, QImage::Format_RGB888);
-                        preview.fill(Qt::black);
                         lastPreview = now;
                     }
                     if (session && now - lastStatistics >= 500ms) {
@@ -1402,6 +1443,7 @@ private:
     std::optional<Settings> apply_;
     std::optional<Settings> start_;
     std::optional<bool> previewSelection_;
+    std::atomic<int> eventPreviewWindowUs_{10'000};
     bool stop_ = false;
     bool quit_ = false;
     QMutex previewMutex_;
@@ -1424,11 +1466,13 @@ public:
         auto *live = new QWidget(this);
         auto *liveLayout = new QVBoxLayout(live);
         previewTitle_ = new QLabel(live);
-        persistenceButton_ = new QPushButton(live);
+        eventWindowButton_ = new QPushButton(live);
+        noiseFilterButton_ = new QPushButton(live);
         auto *previewHeader = new QHBoxLayout;
         previewHeader->addWidget(previewTitle_);
         previewHeader->addStretch();
-        previewHeader->addWidget(persistenceButton_);
+        previewHeader->addWidget(eventWindowButton_);
+        previewHeader->addWidget(noiseFilterButton_);
         liveLayout->addLayout(previewHeader);
         preview_ = new QLabel(live);
         preview_->setAlignment(Qt::AlignCenter);
@@ -1560,6 +1604,7 @@ public:
         });
         previewRgb_ = settings_.recordRgb && !settings_.recordEvents;
         recorder_.selectPreview(previewRgb_);
+        recorder_.setEventPreviewWindowMs(eventWindowMs_);
         refreshPreview();
         connect(previewButton_, &QPushButton::clicked, this, [this] {
             if (recording_ || busy_ || !settings_.recordEvents || !settings_.recordRgb) return;
@@ -1568,11 +1613,16 @@ public:
             refreshPreview();
             updateButtons();
         });
-        connect(persistenceButton_, &QPushButton::clicked, this, [this] {
+        connect(eventWindowButton_, &QPushButton::clicked, this, [this] {
             if (previewRgb_ || !settings_.recordEvents) return;
-            eventPersistence_ = !eventPersistence_;
-            persistentEvents_ = {};
-            lastEventComposite_.reset();
+            eventWindowMs_ = eventWindowMs_ == 5 ? 10 : eventWindowMs_ == 10 ? 20
+                : eventWindowMs_ == 20 ? 50 : 5;
+            recorder_.setEventPreviewWindowMs(eventWindowMs_);
+            updateButtons();
+        });
+        connect(noiseFilterButton_, &QPushButton::clicked, this, [this] {
+            if (previewRgb_ || !settings_.recordEvents) return;
+            filterEventNoise_ = !filterEventNoise_;
             updateButtons();
         });
 
@@ -1633,47 +1683,46 @@ public:
         connect(timer, &QTimer::timeout, this, [this] {
             QImage image;
             if ((previewRgb_ ? recorder_.takeRgbPreview(image) : recorder_.takePreview(image))) {
-                if (!previewRgb_ && eventPersistence_) {
-                    compositeEventPreview(image);
-                    lastImage_ = QPixmap::fromImage(persistentEvents_);
-                }
-                else lastImage_ = QPixmap::fromImage(std::move(image));
+                if (!previewRgb_ && filterEventNoise_) suppressIsolatedEventPixels(image);
+                lastImage_ = QPixmap::fromImage(std::move(image));
                 preview_->setPixmap(lastImage_.scaled(preview_->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
             }
         });
-        timer->start(50);
+        timer->start(16); // Poll often enough to display every 33 ms event frame.
         if (!settings_.recordEvents) counts_->setText("DVXplorer events: not recorded");
         if (!settings_.recordRgb) rgbCounts_->setText("RGB frames: not recorded");
         updateButtons();
     }
 
 private:
-    // Compose only on the Qt display thread. The camera and AEDAT4 writer do
-    // exactly the same work whether this visual aid is enabled or not.
-    void compositeEventPreview(const QImage &incoming) {
-        const auto now = std::chrono::steady_clock::now();
-        if (persistentEvents_.size() != incoming.size()
-            || persistentEvents_.format() != incoming.format() || !lastEventComposite_) {
-            persistentEvents_ = incoming.copy();
-            lastEventComposite_ = now;
-            return;
-        }
-        const double elapsedMs = std::chrono::duration<double, std::milli>(now - *lastEventComposite_).count();
-        const int fade = std::clamp(static_cast<int>(std::lround(256.0 * std::exp2(-elapsedMs / 120.0))), 0, 256);
-        lastEventComposite_ = now;
-        for (int y = 0; y < incoming.height(); ++y) {
-            const auto *source = incoming.constScanLine(y);
-            auto *destination = persistentEvents_.scanLine(y);
-            for (int x = 0; x < incoming.width() * 3; x += 3) {
-                if (source[x] || source[x + 1] || source[x + 2]) {
-                    destination[x] = source[x];
-                    destination[x + 1] = source[x + 1];
-                    destination[x + 2] = source[x + 2];
+    // The filter touches only the screen image; recorded events are unchanged.
+    static void suppressIsolatedEventPixels(QImage &image) {
+        const QImage original = image; // Image detaches on the first write.
+        const auto active = [&original](int x, int y) {
+            const auto *pixel = original.constScanLine(y) + x * 3;
+            return pixel[0] || pixel[1] || pixel[2];
+        };
+        for (int y = 0; y < image.height(); ++y) {
+            auto *row = image.scanLine(y);
+            for (int x = 0; x < image.width(); ++x) {
+                if (!active(x, y)) continue;
+                bool supported = false;
+                for (int dy = -1; dy <= 1 && !supported; ++dy) {
+                    const int neighborY = y + dy;
+                    if (neighborY < 0 || neighborY >= image.height()) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int neighborX = x + dx;
+                        if ((dx || dy) && neighborX >= 0 && neighborX < image.width()
+                            && active(neighborX, neighborY)) {
+                            supported = true;
+                            break;
+                        }
+                    }
                 }
-                else {
-                    destination[x] = static_cast<uchar>((destination[x] * fade) / 256);
-                    destination[x + 1] = static_cast<uchar>((destination[x + 1] * fade) / 256);
-                    destination[x + 2] = static_cast<uchar>((destination[x + 2] * fade) / 256);
+                if (!supported) {
+                    row[x * 3] = 0;
+                    row[x * 3 + 1] = 0;
+                    row[x * 3 + 2] = 0;
                 }
             }
         }
@@ -1708,8 +1757,6 @@ private:
 
     void refreshPreview() {
         lastImage_ = {};
-        persistentEvents_ = {};
-        lastEventComposite_.reset();
         preview_->clear();
         previewTitle_->setText(previewRgb_ ? "Daheng RGB" : "DVXplorer events");
         preview_->setText(previewRgb_ ? "Waiting for Daheng RGB..." : "Waiting for DVXplorer events...");
@@ -1720,8 +1767,10 @@ private:
         record_->setEnabled(recording_ || (ready_ && !busy_));
         previewButton_->setText(previewRgb_ ? "Preview: RGB" : "Preview: Events");
         previewButton_->setEnabled(!recording_ && !busy_ && settings_.recordEvents && settings_.recordRgb);
-        persistenceButton_->setText(eventPersistence_ ? "Event persistence: On" : "Event persistence: Off");
-        persistenceButton_->setEnabled(!previewRgb_ && settings_.recordEvents);
+        eventWindowButton_->setText(QString("Window: %1 ms").arg(eventWindowMs_));
+        eventWindowButton_->setEnabled(!previewRgb_ && settings_.recordEvents);
+        noiseFilterButton_->setText(filterEventNoise_ ? "Noise filter: On" : "Noise filter: Off");
+        noiseFilterButton_->setEnabled(!previewRgb_ && settings_.recordEvents);
         settingsButton_->setEnabled(!recording_ && !busy_);
     }
 
@@ -1730,7 +1779,8 @@ private:
     std::optional<Settings> pendingSettings_;
     QStackedWidget *pages_ = nullptr;
     QLabel *previewTitle_ = nullptr;
-    QPushButton *persistenceButton_ = nullptr;
+    QPushButton *eventWindowButton_ = nullptr;
+    QPushButton *noiseFilterButton_ = nullptr;
     QLabel *preview_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *rgbStatus_ = nullptr;
@@ -1752,9 +1802,8 @@ private:
     QCheckBox *recordRgb_ = nullptr;
     QLineEdit *rgbSerial_ = nullptr;
     QPixmap lastImage_;
-    QImage persistentEvents_;
-    std::optional<std::chrono::steady_clock::time_point> lastEventComposite_;
-    bool eventPersistence_ = true;
+    int eventWindowMs_ = 10;
+    bool filterEventNoise_ = true;
     bool previewRgb_ = false;
     bool ready_ = false;
     bool recording_ = false;
