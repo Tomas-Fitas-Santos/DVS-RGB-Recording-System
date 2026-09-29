@@ -76,6 +76,23 @@ It waits for the DVXplorer, then starts both cameras and prints status and any e
 
 For a recording that must survive an SSH disconnect, launch the command inside `tmux new -s birds-record`; detach with **Ctrl+B, D** and later run `tmux attach -t birds-record` to return and stop with Ctrl+C. You can inspect `.aedat4.monitor.csv` and `.aedat4.report.md` over SSH while the data files stay on the Pi. Screen sharing is unnecessary and has its own CPU and network overhead. Headless mode still uses camera and writer threads; it does not dedicate or pin a CPU core.
 
+### Start the Pi-screen preview and recording from the PC
+
+If you want to keep both previews on the Pi touchscreen, use `--autostart` instead. It launches the **normal GUI on the existing Pi desktop** and starts recording as soon as the DVXplorer is ready. First check the graphical session's display variables in a terminal **on the Pi desktop**:
+
+```bash
+printf 'DISPLAY=%s WAYLAND_DISPLAY=%s XDG_RUNTIME_DIR=%s\n' "$DISPLAY" "$WAYLAND_DISPLAY" "$XDG_RUNTIME_DIR"
+```
+
+Connect by SSH as the same `birds` user while that desktop is logged in. Set the three variables to the values shown on the Pi (for example, `XDG_RUNTIME_DIR=/run/user/1000`, `WAYLAND_DISPLAY=wayland-1`; `DISPLAY` is usually also set). If `WAYLAND_DISPLAY` is set, select Qt's Wayland backend. Otherwise use the desktop's `DISPLAY` value with `QT_QPA_PLATFORM=xcb`. Then:
+
+```bash
+cd ~/Desktop/DVS-RGB-Recording-System
+./build/dvxplorer_recorder --autostart
+```
+
+The preview remains on the Pi screen, and the recording uses the settings last applied in the GUI, including the SSD output directory and monitoring choices. **Ctrl+C in that SSH terminal** requests a clean stop; wait for `Saved ...` before disconnecting storage. The Pi's Stop button also works. Use `tmux` if you need to reattach after an SSH disconnect. SSH only carries text status, so it adds no remote-display encoding load. The local preview still consumes its usual processing time. Do not open another recorder instance while one already owns the cameras.
+
 The RGB raw file is tightly packed BayerRG8: each frame has exactly `width × height` bytes with no per-frame header. Use `byte_offset` and `bytes` in the CSV to read a frame, then demosaic BayerRG8 in analysis. The JSON reports resolution, serial, frame count and errors. At full 2048 × 1536 and 56 fps, RGB alone produces about **168 MiB/s** of raw image data (plus DV events). Check the combined SSD throughput and RGB gap/queue-overflow counts. Zero frame-ID gaps cannot prove the sensor itself never missed a frame.
 
 **Synchronization:** Daheng camera timestamps are native ticks and DVXplorer event/trigger timestamps are native microseconds; their epochs and units are not interchangeable. Host UTC times provide approximate ordering, not precise exposure-to-event alignment. For precise alignment, wire a camera exposure/trigger signal to the DVXplorer external trigger input, verify electrical compatibility, and validate edges against RGB frame IDs in a real test. The app records DVXplorer trigger events but does not generate pulses or assume a fixed clock offset.
