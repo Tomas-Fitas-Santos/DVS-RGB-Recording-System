@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -646,6 +647,12 @@ private:
             std::optional<dv::io::MonoCameraWriter> writer;
             std::unique_ptr<RgbRecorder> rgb;
             std::unique_ptr<RgbRecorder> rgbPreview;
+            struct RgbPreviewAttempt {
+                std::unique_ptr<RgbRecorder> camera;
+                std::string error;
+            };
+            std::future<RgbPreviewAttempt> rgbPreviewAttempt;
+            QString rgbPreviewAttemptSerial;
             std::optional<Session> session;
             std::optional<std::ofstream> monitorLog;
             try {
@@ -924,21 +931,47 @@ private:
                         emit rgbCameraStatus("RGB preview stopped: "
                             + QString::fromStdString(rgbPreview->snapshot().error));
                         rgbPreview.reset();
-                        nextRgbPreviewAttempt = loopStart + 3s;
+                        nextRgbPreviewAttempt = loopStart + 10s;
                     }
-                    if (previewEnabled_ && !writer && !rgb && !rgbPreview
-                        && loopStart >= nextRgbPreviewAttempt) {
-                        try {
-                            rgbPreview = std::make_unique<RgbRecorder>(fs::path{},
-                                current.rgbSerial.toStdString(), rgbPreviewCallback, true);
-                            rgbPreview->start();
+                    if (rgbPreviewAttempt.valid()
+                        && rgbPreviewAttempt.wait_for(0ms) == std::future_status::ready) {
+                        auto result = rgbPreviewAttempt.get();
+                        if (rgbPreviewAttemptSerial != current.rgbSerial) {
+                            nextRgbPreviewAttempt = loopStart;
+                        }
+                        else if (result.camera) {
+                            rgbPreview = std::move(result.camera);
                             emit rgbCameraStatus("RGB live: MER2-302-56U3C ("
                                 + QString::fromStdString(rgbPreview->snapshot().serial) + ")");
                         }
+                        else {
+                            emit rgbCameraStatus("RGB unavailable: "
+                                + QString::fromStdString(result.error) + "; retrying in 10 s");
+                            nextRgbPreviewAttempt = loopStart + 10s;
+                        }
+                    }
+                    if (previewEnabled_ && !writer && !rgb && !rgbPreview
+                        && !rgbPreviewAttempt.valid() && loopStart >= nextRgbPreviewAttempt) {
+                        try {
+                            rgbPreviewAttemptSerial = current.rgbSerial;
+                            rgbPreviewAttempt = std::async(std::launch::async,
+                                [serial = current.rgbSerial.toStdString(), rgbPreviewCallback]() {
+                                    RgbPreviewAttempt result;
+                                    try {
+                                        result.camera = std::make_unique<RgbRecorder>(fs::path{},
+                                            serial, rgbPreviewCallback, true);
+                                        result.camera->start();
+                                    }
+                                    catch (const std::exception &e) {
+                                        result.camera.reset();
+                                        result.error = e.what();
+                                    }
+                                    return result;
+                                });
+                        }
                         catch (const std::exception &e) {
-                            rgbPreview.reset();
                             emit rgbCameraStatus(QString("RGB unavailable: %1; retrying").arg(e.what()));
-                            nextRgbPreviewAttempt = loopStart + 3s;
+                            nextRgbPreviewAttempt = loopStart + 10s;
                         }
                     }
                     const Commands commands = popCommands();
@@ -951,7 +984,8 @@ private:
                     }
                     if (commands.apply && !writer) {
                         try {
-                            if (rgbPreview && current.rgbSerial != commands.apply->rgbSerial) {
+                            if (current.rgbSerial != commands.apply->rgbSerial) {
+                                if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                                 rgbPreview.reset();
                                 nextRgbPreviewAttempt = loopStart;
                             }
@@ -998,6 +1032,7 @@ private:
                                     break;
                                 }
                             }
+                            if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
                             writer.emplace(output.string(), camera);
                             session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
@@ -1274,6 +1309,8 @@ public:
         rgbPanel->addWidget(new QLabel("Daheng RGB", live));
         rgbPreview_ = new QLabel("Connecting to Daheng...", live);
         rgbPreview_->setAlignment(Qt::AlignCenter);
+        rgbPreview_->setWordWrap(true);
+        rgbPreview_->setMargin(12);
         rgbPreview_->setMinimumSize(220, 150);
         rgbPreview_->setStyleSheet("background:#101317;color:white;font-size:20px");
         rgbPanel->addWidget(rgbPreview_, 1);
@@ -1628,6 +1665,8 @@ int main(int argc, char **argv) {
                 application.exit(message.startsWith("Saved ") ? 0 : 1);
             }
         });
+    QObject::connect(&recorder, &dvxrec::Recorder::rgbCameraStatus, &application,
+        [](const QString &message) { logHeadless(message); });
     std::signal(SIGINT, requestStop);
     std::signal(SIGTERM, requestStop);
     auto *signalTimer = new QTimer(&application);
