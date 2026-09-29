@@ -116,7 +116,7 @@ The preview remains on the Pi screen, and the recording uses the settings last a
 
 The RGB raw file is tightly packed BayerRG8: each frame has exactly `width × height` bytes with no per-frame header. Use `byte_offset` and `bytes` in the CSV to read a frame, then demosaic BayerRG8 in analysis. The JSON reports resolution, serial, frame count and errors. At full 2048 × 1536 and 56 fps, RGB alone produces about **168 MiB/s** of raw image data (plus DV events). Check the combined SSD throughput and RGB gap/queue-overflow counts. Zero frame-ID gaps cannot prove the sensor itself never missed a frame.
 
-An RGB writer queue overflow interrupts the recording and means its writer fell behind camera intake; it does not by itself prove that the storage device is the only bottleneck. Check the report's output device and the monitoring CSV. An interrupted session saves a final monitoring sample before draining the RGB queue and another after finalization, so even a short failed recording includes its available measurements. A 16-frame queue at full resolution holds about 48 MiB; enlarging it only delays an overload and uses more RAM.
+An RGB writer queue overflow interrupts the recording and means its writer fell behind camera intake; it does not by itself prove that the storage device is the only bottleneck. Check the report's output device and the monitoring CSV. An interrupted session saves a monitoring sample at failure before draining the RGB queue, so even a short failed recording includes its available measurements. A 16-frame queue at full resolution holds about 48 MiB; enlarging it only delays an overload and uses more RAM.
 
 ### If the Daheng preview is unavailable
 
