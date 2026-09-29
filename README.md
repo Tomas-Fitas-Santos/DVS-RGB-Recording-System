@@ -11,7 +11,7 @@ This branch records **DVXplorer events and Daheng MER2-302-56U3C frames together
 - Shows RGB frame counts, missing frame IDs and incomplete frames live. The existing performance/temperature/storage monitoring includes RGB work in app CPU and process writes; the CSV and report track RGB frame rate, raw throughput and gap counts.
 - Enables both external trigger edges and records them in the same AEDAT4 file, if the DVXplorer receives an external signal. This does not generate trigger pulses or synchronize camera clocks on its own.
 - Stores the camera name, acquisition parameters, UTC host start/end times, and counts in an adjacent `.aedat4.json` file. Camera timestamps in AEDAT4 are authoritative for event-to-trigger alignment; the host times are operational metadata.
-- Provides a touchscreen-friendly settings screen. Settings and recording directory can be changed only between recordings. The DVXplorer worker owns AEDAT4 capture and preview; separate RGB capture and writer threads share a bounded queue. The Qt GUI runs on its normal thread. No thread is pinned to a core.
+- Provides a settings screen on the Pi display. Settings and recording directory can be changed only between recordings. The DVXplorer worker owns AEDAT4 capture and preview; separate RGB capture and writer threads share a bounded queue. The Qt GUI runs on its normal thread. No thread is pinned to a core.
 - Remembers successfully applied settings across app restarts on the Pi.
 - Offers `--headless` recording from an SSH terminal: no Qt display, DVXplorer event preview, RGB color conversion, or screen sharing. Capture, monitoring, and saved reports use the same recorder as the GUI.
 - Optional 1 Hz performance, temperature, and storage diagnostics during capture, shown on the live screen and saved beside each recording.
@@ -57,11 +57,27 @@ Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder aga
 
 1. Connect both cameras over USB 3 and the SSD to a blue Pi USB 3 port. The Pi 5 has two blue ports, so three USB 3 peripherals require a suitable **powered USB 3 hub** on the other port or another storage interface. They share USB bandwidth; test the chosen physical topology under real load.
 2. Open **Settings** while idle. Choose the SSD output directory, adjust contrast and preview interval, and select monitoring. If several Daheng cameras are attached, enter the intended RGB serial. Tap **Apply settings** and wait for the acknowledgement.
-3. Confirm both live previews are visible, then tap **Start recording**. The app briefly reopens the exact Daheng model for BayerRG8/free-running acquisition and creates matching AEDAT4 and RGB raw/index files. Event, trigger and RGB counters update. **Settings** is disabled.
-4. Tap **Stop recording** and wait for **Saved ...** before disconnecting power. The RGB queue drains and both files close; the AEDAT4 index finalizes and the app saves a report.
+3. Confirm both live previews are visible, then click **Start recording**. The app briefly reopens the exact Daheng model for BayerRG8/free-running acquisition and creates matching AEDAT4 and RGB raw/index files. Event, trigger and RGB counters update. **Settings** is disabled.
+4. Click **Stop recording** and wait for **Saved ...** before disconnecting power. The RGB queue drains and both files close; the AEDAT4 index finalizes and the app saves a report.
 5. Inspect the file with `dv-filestat -v /path/to/file.aedat4` or open it with `dv::io::MonoCameraRecording` / DV GUI. When testing the external trigger wiring, verify the file actually contains trigger events and that the count rises.
 
 The app stops a recording when free space drops below 1 GiB, and refuses to start when less than 2 GiB is available; it checks every 500 ms while recording. An interrupted session is marked in its metadata if the process is still running. Sudden power loss can leave the current AEDAT4 incomplete, so stop and wait for completion before powering down.
+
+### Build and control the HDMI app from SSH
+
+From your PC's SSH terminal, in the repository directory, use the launcher. It detects the logged-in Pi desktop's Wayland or X11 socket and opens the **normal app window on the HDMI monitor**. The recording still begins and ends with the app's buttons.
+
+```bash
+cd ~/Desktop/DVS-RGB-Recording-System
+bash scripts/recorder.sh build      # Compile current source; app must be closed
+bash scripts/recorder.sh start      # Open the app on the Pi HDMI desktop
+bash scripts/recorder.sh status     # Check whether it is still running
+bash scripts/recorder.sh stop       # Close; safely finish an active recording first
+bash scripts/recorder.sh restart    # Stop, build, and open again
+bash scripts/recorder.sh logs       # Read recent startup/finalization messages
+```
+
+Run `git pull --rebase origin tomas-dvs-rgb` separately when you want to fetch branch changes; the launcher never edits Git files. `restart` closes the current app and stops any active recording before rebuilding, so use it between sessions. `stop` asks the GUI to finish both files and the report, waits for the process to exit, and leaves it running with an error message if finalization takes longer than 120 seconds. Do not unplug the SSD until the process has stopped. The launcher itself exits after opening the app; no VNC session or additional recording service is left running. Its status and log live under `~/.local/state/dvs-rgb-recorder/`.
 
 ### Remote recording over SSH without a desktop
 
