@@ -55,6 +55,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <time.h>
 #include <utility>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -132,6 +133,42 @@ std::optional<double> readNumber(const char *path, double divisor = 1.0) {
     double value = 0;
     if (file >> value) {
         return value / divisor;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> recorderThreadCpuSeconds() {
+    timespec cpu{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu) != 0) return std::nullopt;
+    return cpu.tv_sec + cpu.tv_nsec / 1'000'000'000.0;
+}
+
+struct UsbLink {
+    std::string port;
+    double speedMbps = 0;
+};
+
+std::optional<UsbLink> dvxplorerUsbLink(const std::string &cameraName) {
+    constexpr std::string_view prefix = "DVXplorer_";
+    if (!cameraName.starts_with(prefix)) return std::nullopt;
+    const std::string serial(cameraName.substr(prefix.size()));
+    std::error_code error;
+    fs::directory_iterator devices("/sys/bus/usb/devices", error);
+    if (error) return std::nullopt;
+    for (; devices != fs::directory_iterator{}; devices.increment(error)) {
+        if (error) break;
+        const auto &device = *devices;
+        const auto readToken = [&](const char *name) {
+            std::ifstream file(device.path() / name);
+            std::string value;
+            file >> value;
+            return value;
+        };
+        if (readToken("idVendor") != "152a" || readToken("idProduct") != "8419"
+            || readToken("serial") != serial) continue;
+        const auto path = (device.path() / "speed").string();
+        const auto speed = readNumber(path.c_str());
+        if (speed) return UsbLink{device.path().filename().string(), *speed};
     }
     return std::nullopt;
 }
@@ -228,7 +265,10 @@ std::string storageDevice(const fs::path &directory) {
 }
 
 struct BlockStats {
+    unsigned long long writesCompleted = 0;
     unsigned long long sectorsWritten = 0;
+    unsigned long long writeMillis = 0;
+    unsigned long long inFlight = 0;
     unsigned long long ioMillis = 0;
 };
 
@@ -239,7 +279,7 @@ std::optional<BlockStats> readBlockStats(const fs::path &path) {
     for (auto &field : fields) {
         if (!(file >> field)) return std::nullopt;
     }
-    return BlockStats{fields[6], fields[9]}; // 512-byte sectors written; milliseconds active.
+    return BlockStats{fields[4], fields[6], fields[7], fields[8], fields[9]};
 }
 
 qint64 completedFileSize(const fs::path &file) {
@@ -375,7 +415,10 @@ private:
         std::string storageDeviceName;
         std::optional<double> finalizeMs;
         quint64 peakEventsPerSecond = 0;
+        quint64 peakEventsPer10Ms = 0;
         std::optional<double> maxCaptureLagMs;
+        quint64 captureLagEpisodes50Ms = 0;
+        std::optional<UsbLink> dvUsbLink;
         RgbRecorder::Summary rgb;
         fs::path rgbRawFile;
         fs::path rgbIndexFile;
@@ -407,6 +450,14 @@ private:
             {"writer_finalize_ms", session.finalizeMs
                 ? QJsonValue(*session.finalizeMs) : QJsonValue()},
             {"peak_events_per_second", static_cast<qint64>(session.peakEventsPerSecond)},
+            {"peak_events_per_10ms", static_cast<qint64>(session.peakEventsPer10Ms)},
+            {"capture_lag_episodes_over_50ms", session.settings.recordEvents
+                && (session.settings.performanceMonitoring || session.settings.storageMonitoring)
+                    ? QJsonValue(static_cast<qint64>(session.captureLagEpisodes50Ms)) : QJsonValue()},
+            {"dv_usb_port", session.dvUsbLink
+                ? QString::fromStdString(session.dvUsbLink->port) : QString{}},
+            {"dv_usb_speed_mbps", session.dvUsbLink
+                ? QJsonValue(session.dvUsbLink->speedMbps) : QJsonValue()},
             {"event_loss_count_available", false},
             {"rgb_camera", session.settings.recordRgb ? "MER2-302-56U3C" : ""},
             {"rgb_pixel_format", session.settings.recordRgb ? "BayerRG8" : ""},
@@ -420,6 +471,7 @@ private:
             {"rgb_missing_frame_ids", static_cast<qint64>(session.rgb.missingFrameIds)},
             {"rgb_incomplete_frames", static_cast<qint64>(session.rgb.incompleteFrames)},
             {"rgb_queue_overflows", static_cast<qint64>(session.rgb.queueOverflows)},
+            {"rgb_max_queue_depth", static_cast<qint64>(session.rgb.maxQueueDepth)},
             {"rgb_bytes", static_cast<qint64>(session.rgb.bytes)},
             {"rgb_error", QString::fromStdString(session.rgb.error)},
             {"rgb_raw_file", QString::fromStdString(session.rgbRawFile.filename().string())},
@@ -465,9 +517,12 @@ private:
             {"events_total", "Recorded events, cumulative"},
             {"triggers_total", "Recorded triggers, cumulative"},
             {"event_rate_eps", "Recorded events per host second"},
+            {"peak_10ms_event_rate_eps", "Highest 10 ms camera-time event rate in interval (events/s)"},
             {"trigger_rate_hz", "Recorded triggers per host second"},
             {"app_cpu_pct_total_capacity", "App CPU (% of all online cores)"},
+            {"recorder_thread_cpu_pct_one_core", "Recorder worker CPU (% of one core)"},
             {"system_cpu_pct", "Whole Pi CPU (%)"},
+            {"dv_usb_speed_mbps", "DVXplorer negotiated USB link (Mb/s)"},
             {"app_resident_ram_mib", "App RAM resident (MiB)"},
             {"cpu_freq_mhz", "CPU 0 frequency (MHz)"},
             {"max_capture_loop_gap_ms", "Longest capture-loop gap (ms)"},
@@ -482,9 +537,13 @@ private:
             {"io_psi_some_avg10", "System I/O pressure, some avg10 (%)"},
             {"storage_device_write_mib_s", "Storage-device completed writes (MiB/s)"},
             {"device_io_busy_pct", "Storage-device busy time (%)"},
+            {"device_avg_write_latency_ms", "Device mean completed-write latency (ms)"},
+            {"device_inflight_ios", "Device I/O requests in flight at sample"},
             {"writer_finalize_ms", "AEDAT4 writer finalization (ms)"},
             {"peak_events_per_second", "Peak recorded events in a camera-timestamp second"},
             {"relative_capture_lag_ms", "Relative capture lag (ms)"},
+            {"max_relative_capture_lag_interval_ms", "Worst relative capture lag in interval (ms)"},
+            {"capture_lag_episodes_50ms_total", "Relative lag episodes >=50 ms, cumulative"},
             {"lost_events_total", "Lost events, cumulative"},
             {"lost_events_per_s", "Lost events per second"},
             {"rgb_frames_total", "RGB frames written, cumulative"},
@@ -492,7 +551,9 @@ private:
             {"rgb_raw_mib_s", "RGB raw bytes written (MiB/s)"},
             {"rgb_missing_frame_ids", "RGB missing frame IDs, cumulative"},
             {"rgb_incomplete_frames", "RGB incomplete frames, cumulative"},
-            {"rgb_queue_overflows", "RGB writer queue overflows, cumulative"}
+            {"rgb_queue_overflows", "RGB writer queue overflows, cumulative"},
+            {"rgb_queue_depth", "RGB writer queue occupancy (frames)"},
+            {"rgb_max_queue_depth", "RGB writer queue high-water mark (frames)"}
         };
 
         QStringList columns;
@@ -569,6 +630,8 @@ private:
                     ? QString("%1 / %2 / %3").arg(groupedCount(session.rgb.missingFrameIds),
                         groupedCount(session.rgb.incompleteFrames), groupedCount(session.rgb.queueOverflows))
                     : "not recorded"),
+            QString("- RGB writer queue high-water mark: %1 / 16 frames")
+                .arg(session.settings.recordRgb ? groupedCount(session.rgb.maxQueueDepth) : "not recorded"),
             session.settings.recordRgb
                 ? QString("- RGB raw / frame index: `%1` / `%2`")
                     .arg(QString::fromStdString(session.rgbRawFile.filename().string()),
@@ -581,6 +644,9 @@ private:
             QString("- Peak recorded events in a one-second camera-timestamp bin: %1")
                 .arg(session.settings.recordEvents
                     ? groupedCount(session.peakEventsPerSecond) : "not recorded"),
+            QString("- Peak recorded events in a 10 ms camera-timestamp bin: %1 (%2 events/s equivalent)")
+                .arg(session.settings.recordEvents ? groupedCount(session.peakEventsPer10Ms) : "not recorded")
+                .arg(session.settings.recordEvents ? groupedCount(session.peakEventsPer10Ms * 100) : "not recorded"),
             session.settings.recordEvents
                 ? QString("- AEDAT4 size: %1 bytes").arg(completedFileSize(session.file))
                 : QString("- AEDAT4: not recorded"),
@@ -588,6 +654,12 @@ private:
                 ? QString::number(*session.finalizeMs, 'f', 2) : "unavailable"),
             QString("- Max relative capture lag: %1 ms").arg(session.maxCaptureLagMs
                 ? QString::number(*session.maxCaptureLagMs, 'f', 2) : "unavailable"),
+            QString("- Relative lag episodes >=50 ms: %1").arg(!session.settings.recordEvents
+                ? "not recorded" : (session.settings.performanceMonitoring || session.settings.storageMonitoring)
+                    ? groupedCount(session.captureLagEpisodes50Ms) : "unavailable (monitoring off)"),
+            QString("- DVXplorer USB link: %1").arg(session.dvUsbLink
+                ? QString("%1 Mb/s (%2)").arg(session.dvUsbLink->speedMbps, 0, 'f', 0)
+                    .arg(QString::fromStdString(session.dvUsbLink->port)) : "unavailable"),
             QString("- Output device: %1").arg(session.storageDeviceName.empty()
                 ? "unavailable" : QString::fromStdString(session.storageDeviceName)),
             QString("- ON/OFF contrast: %1 / %2").arg(session.settings.contrastOn)
@@ -668,6 +740,8 @@ private:
             << "Lost-event totals and rates are unavailable through this recorder's camera interface; blank values do not mean zero loss."
             << "File growth and Linux write counts can reflect buffering; device writes include other processes."
             << "Relative capture lag is a change from the first event batch, not absolute sensor latency."
+            << "The 10 ms rate is computed from received events in fixed camera-timestamp bins, not from USB byte counts. The negotiated USB speed is a link rating, not measured traffic or proof of zero loss."
+            << "Lag episodes count crossings above 50 ms; one-second latest-lag samples may miss a short spike, so compare them with the interval maximum. Device write latency and in-flight I/O include other processes."
             << "When RGB is recorded, frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss. When both sources are recorded, their camera clocks are independent without an external electrical sync signal."
             << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
             << "";
@@ -744,6 +818,7 @@ private:
                     publishRgbPreview(std::move(frame));
                 };
                 auto previousCpuClock = std::clock();
+                auto previousRecorderThreadCpu = recorderThreadCpuSeconds();
                 const long onlineCores = std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN));
                 auto previousSystemTicks = current.performanceMonitoring
                     ? systemCpuTicks() : std::optional<CpuTicks>{};
@@ -756,10 +831,14 @@ private:
                 double writerTimeMs = 0;
                 std::optional<std::int64_t> firstEventTimestampUs;
                 quint64 eventSecondBin = 0, eventSecondCount = 0;
+                std::int64_t event10MsEndUs = 0;
+                quint64 event10MsCount = 0, max10MsCountInterval = 0;
                 std::optional<std::int64_t> lagBaselineTimestampUs;
                 std::optional<std::int64_t> lagLastTimestampUs;
                 std::chrono::steady_clock::time_point lagBaselineHost;
                 std::optional<double> latestCaptureLagMs;
+                std::optional<double> maxCaptureLagIntervalMs;
+                bool captureLagAbove50Ms = false;
                 std::optional<double> lastDiskFreeMiB;
                 std::optional<std::uintmax_t> previousFileSize;
                 fs::path blockStatsFile;
@@ -776,9 +855,9 @@ private:
                         return;
                     }
                     const bool shortFinalSample = finalSample && elapsed < 0.5;
-                    std::optional<double> processCpu, systemCpu, rssMiB, writeMiBs, frequencyMHz;
+                    std::optional<double> processCpu, recorderThreadCpu, systemCpu, rssMiB, writeMiBs, frequencyMHz;
                     std::optional<double> fileMiBs, dirtyMiB, writebackMiB, ioPressure;
-                    std::optional<double> deviceWriteMiBs, deviceBusyPercent;
+                    std::optional<double> deviceWriteMiBs, deviceBusyPercent, deviceWriteLatencyMs, deviceInFlight;
                     std::optional<double> temperatureC;
                     if (current.performanceMonitoring) {
                         const auto cpuNow = std::clock();
@@ -788,6 +867,13 @@ private:
                                 / CLOCKS_PER_SEC / elapsed / onlineCores, 0.0, 100.0);
                         }
                         previousCpuClock = cpuNow;
+                        const auto recorderCpuNow = recorderThreadCpuSeconds();
+                        if (recorderCpuNow && previousRecorderThreadCpu
+                            && *recorderCpuNow >= *previousRecorderThreadCpu) {
+                            recorderThreadCpu = std::clamp(100.0 * (*recorderCpuNow - *previousRecorderThreadCpu)
+                                / elapsed, 0.0, 100.0);
+                        }
+                        previousRecorderThreadCpu = recorderCpuNow;
                         const auto systemNow = systemCpuTicks();
                         if (systemNow && previousSystemTicks && systemNow->total > previousSystemTicks->total
                             && systemNow->busy >= previousSystemTicks->busy) {
@@ -831,6 +917,13 @@ private:
                                 * 512.0 / (1024.0 * 1024.0) / elapsed;
                             deviceBusyPercent = (blockNow->ioMillis - previousBlockStats->ioMillis)
                                 / (elapsed * 10.0);
+                            if (blockNow->writesCompleted > previousBlockStats->writesCompleted
+                                && blockNow->writeMillis >= previousBlockStats->writeMillis) {
+                                deviceWriteLatencyMs = static_cast<double>(
+                                    blockNow->writeMillis - previousBlockStats->writeMillis)
+                                    / (blockNow->writesCompleted - previousBlockStats->writesCompleted);
+                            }
+                            deviceInFlight = static_cast<double>(blockNow->inFlight);
                         }
                         previousBlockStats = blockNow;
                     }
@@ -839,14 +932,19 @@ private:
                     }
                     if (shortFinalSample) {
                         processCpu.reset();
+                        recorderThreadCpu.reset();
                         systemCpu.reset();
                         fileMiBs.reset();
                         writeMiBs.reset();
                         deviceWriteMiBs.reset();
                         deviceBusyPercent.reset();
+                        deviceWriteLatencyMs.reset();
+                        deviceInFlight.reset();
                     }
                     const std::optional<double> eventRate = shortFinalSample || (session && !session->settings.recordEvents)
                         ? std::nullopt : std::optional<double>(session ? (session->events - previousEvents) / elapsed : 0);
+                    const std::optional<double> peak10MsRate = session && session->settings.recordEvents
+                        ? std::optional<double>(max10MsCountInterval * 100.0) : std::nullopt;
                     const std::optional<double> triggerRate = shortFinalSample || (session && !session->settings.recordEvents)
                         ? std::nullopt : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
                     const auto rgbNow = rgb ? rgb->snapshot() : (session ? session->rgb : RgbRecorder::Summary{});
@@ -867,6 +965,11 @@ private:
                         summary << QString("Longest gap between capture checks: %1 ms | App RAM: %2 MiB")
                             .arg(QString::number(maxPollGapMs, 'f', 1))
                             .arg(rssMiB ? QString::number(*rssMiB, 'f', 0) : "n/a");
+                        summary << QString("Worker CPU: %1% of one core | 10 ms peak: %2 events/s | DV USB: %3 Mb/s")
+                            .arg(recorderThreadCpu ? QString::number(*recorderThreadCpu, 'f', 0) : "n/a")
+                            .arg(peak10MsRate ? groupedCount(static_cast<quint64>(std::llround(*peak10MsRate))) : "n/a")
+                            .arg(session && session->dvUsbLink
+                                ? QString::number(session->dvUsbLink->speedMbps, 'f', 0) : "n/a");
                     }
                     if (current.temperatureMonitoring) {
                         summary << (temperatureC
@@ -878,16 +981,28 @@ private:
                             .arg(fileMiBs ? QString::number(*fileMiBs, 'f', 1) : "n/a")
                             .arg(deviceWriteMiBs ? QString::number(*deviceWriteMiBs, 'f', 1) : "n/a")
                             .arg(deviceBusyPercent ? QString::number(*deviceBusyPercent, 'f', 0) : "n/a");
-                        summary << QString("Slowest AEDAT write: %1 ms | Relative capture lag: %2 ms")
+                        summary << QString("AEDAT write max: %1 ms | Lag latest/max: %2/%3 ms | >=50 ms episodes: %4")
                             .arg(QString::number(maxWriterCallMs, 'f', 1))
-                            .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a");
+                            .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a")
+                            .arg(maxCaptureLagIntervalMs ? QString::number(*maxCaptureLagIntervalMs, 'f', 1) : "n/a")
+                            .arg(session ? groupedCount(session->captureLagEpisodes50Ms) : "n/a");
                         summary << "Lost events: unavailable (total and per second)";
+                    }
+                    if (current.performanceMonitoring && !current.storageMonitoring
+                        && session && session->settings.recordEvents) {
+                        summary << QString("Relative lag latest/worst interval: %1/%2 ms | >=50 ms episodes: %3")
+                            .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a")
+                            .arg(maxCaptureLagIntervalMs ? QString::number(*maxCaptureLagIntervalMs, 'f', 1) : "n/a")
+                            .arg(groupedCount(session->captureLagEpisodes50Ms));
                     }
                     if (session && session->settings.recordRgb) {
                         summary << QString("RGB: %1 frames/s | raw written: %2 MiB/s | missing IDs: %3")
                             .arg(rgbRate ? QString::number(*rgbRate, 'f', 1) : "n/a")
                             .arg(rgbMiBs ? QString::number(*rgbMiBs, 'f', 1) : "n/a")
                             .arg(groupedCount(rgbNow.missingFrameIds));
+                        summary << QString("RGB writer queue: %1/16 frames | highest: %2/16")
+                            .arg(groupedCount(rgbNow.queueDepth))
+                            .arg(groupedCount(rgbNow.maxQueueDepth));
                     }
                     if (session && !session->monitorError.isEmpty()) {
                         summary << session->monitorError;
@@ -898,8 +1013,11 @@ private:
                             << std::chrono::duration<double>(now - sessionStart).count() << ','
                             << (session->settings.recordEvents ? std::to_string(session->events) : "") << ','
                             << (session->settings.recordEvents ? std::to_string(session->triggers) : "") << ','
-                            << csvNumber(eventRate) << ',' << csvNumber(triggerRate) << ','
-                            << csvNumber(processCpu) << ',' << csvNumber(systemCpu) << ','
+                            << csvNumber(eventRate) << ',' << csvNumber(peak10MsRate) << ','
+                            << csvNumber(triggerRate) << ','
+                            << csvNumber(processCpu) << ',' << csvNumber(recorderThreadCpu) << ','
+                            << csvNumber(systemCpu) << ','
+                            << (session->dvUsbLink ? csvNumber(session->dvUsbLink->speedMbps) : "") << ','
                             << csvNumber(rssMiB) << ',' << csvNumber(frequencyMHz) << ','
                             << (current.performanceMonitoring ? csvNumber(maxPollGapMs) : "") << ','
                             << csvNumber(temperatureC) << ','
@@ -910,16 +1028,24 @@ private:
                             << csvNumber(dirtyMiB) << ',' << csvNumber(writebackMiB) << ','
                             << csvNumber(ioPressure) << ',' << csvNumber(deviceWriteMiBs) << ','
                             << csvNumber(deviceBusyPercent) << ','
+                            << csvNumber(deviceWriteLatencyMs) << ',' << csvNumber(deviceInFlight) << ','
                             << (session->finalizeMs ? csvNumber(*session->finalizeMs) : "") << ','
                             << (session->settings.recordEvents ? std::to_string(session->peakEventsPerSecond) : "") << ','
-                            << (current.storageMonitoring && session->settings.recordEvents ? csvNumber(latestCaptureLagMs) : "")
-                            << ",,," << (session->settings.recordEvents
-                                ? (current.storageMonitoring ? "unavailable" : "disabled") : "not_recorded") << ','
+                            << ((current.performanceMonitoring || current.storageMonitoring) && session->settings.recordEvents
+                                ? csvNumber(latestCaptureLagMs) : "") << ','
+                            << ((current.performanceMonitoring || current.storageMonitoring) && session->settings.recordEvents
+                                ? csvNumber(maxCaptureLagIntervalMs) : "") << ','
+                            << ((current.performanceMonitoring || current.storageMonitoring)
+                                && session->settings.recordEvents
+                                ? std::to_string(session->captureLagEpisodes50Ms) : "")
+                            << ",,," << (session->settings.recordEvents ? "unavailable" : "not_recorded") << ','
                             << (session->settings.recordRgb ? std::to_string(rgbNow.frames) : "") << ','
                             << csvNumber(rgbRate) << ',' << csvNumber(rgbMiBs) << ','
                             << (session->settings.recordRgb ? std::to_string(rgbNow.missingFrameIds) : "") << ','
                             << (session->settings.recordRgb ? std::to_string(rgbNow.incompleteFrames) : "") << ','
-                            << (session->settings.recordRgb ? std::to_string(rgbNow.queueOverflows) : "") << '\n'
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.queueOverflows) : "") << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.queueDepth) : "") << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.maxQueueDepth) : "") << '\n'
                             << std::flush;
                         if (!monitorLog->good()) {
                             session->monitorError = "Monitoring CSV write failed";
@@ -932,6 +1058,8 @@ private:
                     previousRgbFrames = session ? rgbNow.frames : 0;
                     previousRgbBytes = session ? rgbNow.bytes : 0;
                     maxPollGapMs = 0;
+                    max10MsCountInterval = 0;
+                    maxCaptureLagIntervalMs.reset();
                     maxWriterCallMs = 0;
                     writerTimeMs = 0;
                     lastMonitoring = now;
@@ -1112,6 +1240,7 @@ private:
                             if (!current.recordRgb) previewRgb = false;
                             lastMonitoring = std::chrono::steady_clock::now();
                             previousCpuClock = std::clock();
+                            previousRecorderThreadCpu = recorderThreadCpuSeconds();
                             previousSystemTicks = current.performanceMonitoring
                                 ? systemCpuTicks() : std::optional<CpuTicks>{};
                             previousWrittenBytes = current.storageMonitoring
@@ -1164,6 +1293,7 @@ private:
                             if (current.recordEvents) writer.emplace(output.string(), *camera);
                             session = Session{output, current,
                                 current.recordEvents ? QString::fromStdString(camera->getCameraName()) : QString{}, utcNow()};
+                            if (current.recordEvents) session->dvUsbLink = dvxplorerUsbLink(camera->getCameraName());
                             if (current.recordRgb) {
                                 rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
                                     previewEnabled_ && previewRgb ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
@@ -1193,15 +1323,19 @@ private:
                                 }
                                 else {
                                     *monitorLog << "utc,elapsed_s,events_total,triggers_total,event_rate_eps,"
-                                        "trigger_rate_hz,app_cpu_pct_total_capacity,system_cpu_pct,"
+                                        "peak_10ms_event_rate_eps,trigger_rate_hz,app_cpu_pct_total_capacity,"
+                                        "recorder_thread_cpu_pct_one_core,system_cpu_pct,dv_usb_speed_mbps,"
                                         "app_resident_ram_mib,cpu_freq_mhz,max_capture_loop_gap_ms,"
                                         "temperature_c,free_disk_mib,aedat_file_growth_mib_s,"
                                         "process_write_mib_s,slowest_aedat_write_ms,writer_time_ms,dirty_mib,"
                                         "writeback_mib,io_psi_some_avg10,storage_device_write_mib_s,"
-                                        "device_io_busy_pct,writer_finalize_ms,peak_events_per_second,"
-                                        "relative_capture_lag_ms,lost_events_total,lost_events_per_s,"
+                                        "device_io_busy_pct,device_avg_write_latency_ms,device_inflight_ios,"
+                                        "writer_finalize_ms,peak_events_per_second,relative_capture_lag_ms,"
+                                        "max_relative_capture_lag_interval_ms,capture_lag_episodes_50ms_total,"
+                                        "lost_events_total,lost_events_per_s,"
                                         "loss_count_status,rgb_frames_total,rgb_frame_rate_hz,rgb_raw_mib_s,"
-                                        "rgb_missing_frame_ids,rgb_incomplete_frames,rgb_queue_overflows\n" << std::flush;
+                                        "rgb_missing_frame_ids,rgb_incomplete_frames,rgb_queue_overflows,"
+                                        "rgb_queue_depth,rgb_max_queue_depth\n" << std::flush;
                                     if (!monitorLog->good()) {
                                         session->monitorError = "Cannot write monitoring CSV header";
                                         monitorLog.reset();
@@ -1213,6 +1347,7 @@ private:
                             lastMonitoring = sessionStart;
                             lastLoopStart = sessionStart;
                             previousCpuClock = std::clock();
+                            previousRecorderThreadCpu = recorderThreadCpuSeconds();
                             previousSystemTicks = current.performanceMonitoring
                                 ? systemCpuTicks() : std::optional<CpuTicks>{};
                             previousWrittenBytes = current.storageMonitoring
@@ -1224,9 +1359,13 @@ private:
                             maxPollGapMs = maxWriterCallMs = writerTimeMs = 0;
                             firstEventTimestampUs.reset();
                             eventSecondBin = eventSecondCount = 0;
+                            event10MsEndUs = 0;
+                            event10MsCount = max10MsCountInterval = 0;
                             lagBaselineTimestampUs.reset();
                             lagLastTimestampUs.reset();
                             latestCaptureLagMs.reset();
+                            maxCaptureLagIntervalMs.reset();
+                            captureLagAbove50Ms = false;
                             saveMetadata(*session, "recording");
                             emit statistics(0, 0);
                             emit rgbStatistics(0, 0, 0);
@@ -1256,6 +1395,8 @@ private:
                                     std::chrono::steady_clock::now() - beforeWrite).count();
                                 maxWriterCallMs = std::max(maxWriterCallMs, millis);
                                 writerTimeMs += millis;
+                            }
+                            if (current.performanceMonitoring || current.storageMonitoring) {
                                 const auto latestTimestampUs = events->getHighestTime();
                                 const auto arrival = std::chrono::steady_clock::now();
                                 if (!lagBaselineTimestampUs || (lagLastTimestampUs
@@ -1263,6 +1404,7 @@ private:
                                     lagBaselineTimestampUs = latestTimestampUs;
                                     lagBaselineHost = arrival;
                                     latestCaptureLagMs = 0;
+                                    captureLagAbove50Ms = false;
                                 }
                                 else {
                                     latestCaptureLagMs = std::max(0.0,
@@ -1272,6 +1414,13 @@ private:
                                 lagLastTimestampUs = latestTimestampUs;
                                 session->maxCaptureLagMs = std::max(
                                     session->maxCaptureLagMs.value_or(0.0), *latestCaptureLagMs);
+                                maxCaptureLagIntervalMs = std::max(
+                                    maxCaptureLagIntervalMs.value_or(0.0), *latestCaptureLagMs);
+                                if (*latestCaptureLagMs >= 50.0 && !captureLagAbove50Ms) {
+                                    ++session->captureLagEpisodes50Ms;
+                                    captureLagAbove50Ms = true;
+                                }
+                                else if (*latestCaptureLagMs < 50.0) captureLagAbove50Ms = false;
                             }
                         }
                         // Camera-timestamp peak counting remains active without a display.
@@ -1294,6 +1443,8 @@ private:
                                     firstEventTimestampUs = timestampUs;
                                     eventSecondBin = 0;
                                     eventSecondCount = 0;
+                                    event10MsEndUs = timestampUs + 10'000;
+                                    event10MsCount = 0;
                                 }
                                 const auto bin = static_cast<quint64>(
                                     (timestampUs - *firstEventTimestampUs) / 1'000'000);
@@ -1303,6 +1454,14 @@ private:
                                 }
                                 session->peakEventsPerSecond = std::max(
                                     session->peakEventsPerSecond, ++eventSecondCount);
+                                if (timestampUs >= event10MsEndUs || timestampUs < event10MsEndUs - 10'000) {
+                                    session->peakEventsPer10Ms = std::max(session->peakEventsPer10Ms, event10MsCount);
+                                    max10MsCountInterval = std::max(max10MsCountInterval, event10MsCount);
+                                    const auto tenMsBin = (timestampUs - *firstEventTimestampUs) / 10'000;
+                                    event10MsEndUs = *firstEventTimestampUs + (tenMsBin + 1) * 10'000;
+                                    event10MsCount = 0;
+                                }
+                                ++event10MsCount;
                             }
                             if (!previewEnabled_ || previewRgb) continue;
                             if (position++ % stride != 0) {
@@ -1316,6 +1475,10 @@ private:
                                     eventPreviewPolarities[pixel] = event.polarity();
                                 }
                             }
+                        }
+                        if (writer) {
+                            session->peakEventsPer10Ms = std::max(session->peakEventsPer10Ms, event10MsCount);
+                            max10MsCountInterval = std::max(max10MsCountInterval, event10MsCount);
                         }
                     }
                     if (auto triggers = camera->getNextTriggerBatch(); triggers && !triggers->empty()) {
