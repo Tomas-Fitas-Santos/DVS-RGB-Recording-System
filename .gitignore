@@ -2,3 +2,4 @@
 /cmake-build-*/
 *.aedat4
 *.aedat4.json
+/stress_test_reports/
