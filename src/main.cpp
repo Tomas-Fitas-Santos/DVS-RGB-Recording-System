@@ -73,6 +73,8 @@ struct Settings {
     bool temperatureMonitoring = false;
     bool storageMonitoring = false;
     QString rgbSerial;
+    bool recordEvents = true;
+    bool recordRgb = true;
 };
 
 Settings loadSavedSettings() {
@@ -89,6 +91,9 @@ Settings loadSavedSettings() {
     settings.temperatureMonitoring = saved.value("temperatureMonitoring", false).toBool();
     settings.storageMonitoring = saved.value("storageMonitoring", false).toBool();
     settings.rgbSerial = saved.value("rgbSerial", "").toString().trimmed();
+    settings.recordEvents = saved.value("recordEvents", true).toBool();
+    settings.recordRgb = saved.value("recordRgb", true).toBool();
+    if (!settings.recordEvents && !settings.recordRgb) settings.recordEvents = true;
     return settings;
 }
 
@@ -102,6 +107,8 @@ void saveSettings(const Settings &settings) {
     saved.setValue("temperatureMonitoring", settings.temperatureMonitoring);
     saved.setValue("storageMonitoring", settings.storageMonitoring);
     saved.setValue("rgbSerial", settings.rgbSerial);
+    saved.setValue("recordEvents", settings.recordEvents);
+    saved.setValue("recordRgb", settings.recordRgb);
 }
 
 fs::path nativePath(const QString &path) {
@@ -241,7 +248,7 @@ qint64 completedFileSize(const fs::path &file) {
     return error ? -1 : static_cast<qint64>(bytes);
 }
 
-// The worker owns the USB capture and AEDAT4 writer. No camera/writer method runs
+// The worker owns USB capture and the optional AEDAT4 writer. No camera/writer method runs
 // on the GUI thread. A single latest-frame slot prevents preview backpressure.
 class Recorder final : public QObject {
     Q_OBJECT
@@ -277,6 +284,11 @@ public:
     void stop() {
         std::lock_guard lock(commandsMutex_);
         stop_ = true;
+    }
+
+    void selectPreview(bool rgb) {
+        std::lock_guard lock(commandsMutex_);
+        previewSelection_ = rgb;
     }
 
     bool takePreview(QImage &image) {
@@ -320,15 +332,17 @@ private:
     struct Commands {
         std::optional<Settings> apply;
         std::optional<Settings> start;
+        std::optional<bool> previewRgb;
         bool stop = false;
         bool quit = false;
     };
 
     Commands popCommands() {
         std::lock_guard lock(commandsMutex_);
-        Commands commands{std::move(apply_), std::move(start_), stop_, quit_};
+        Commands commands{std::move(apply_), std::move(start_), std::move(previewSelection_), stop_, quit_};
         apply_.reset();
         start_.reset();
+        previewSelection_.reset();
         stop_ = false;
         return commands;
     }
@@ -365,8 +379,11 @@ private:
 
     static void saveMetadata(const Session &session, const QString &state, const QString &error = {}) {
         QJsonObject json{
-            {"format", "AEDAT4"},
+            {"format", session.settings.recordEvents
+                ? (session.settings.recordRgb ? "AEDAT4+RGB_RAW" : "AEDAT4") : "RGB_RAW"},
             {"camera", session.cameraName},
+            {"record_events", session.settings.recordEvents},
+            {"record_rgb", session.settings.recordRgb},
             {"recording_state", state},
             {"start_utc", session.startUtc},
             {"end_utc", state == "recording" ? QString{} : session.endUtc},
@@ -379,14 +396,17 @@ private:
             {"temperature_monitoring", session.settings.temperatureMonitoring},
             {"storage_monitoring", session.settings.storageMonitoring},
             {"storage_device", QString::fromStdString(session.storageDeviceName)},
-            {"aedat_bytes", completedFileSize(session.file)},
+            {"aedat_file", session.settings.recordEvents
+                ? QString::fromStdString(session.file.filename().string()) : QString{}},
+            {"aedat_bytes", session.settings.recordEvents
+                ? QJsonValue(completedFileSize(session.file)) : QJsonValue()},
             {"writer_finalize_ms", session.finalizeMs
                 ? QJsonValue(*session.finalizeMs) : QJsonValue()},
             {"peak_events_per_second", static_cast<qint64>(session.peakEventsPerSecond)},
             {"event_loss_count_available", false},
-            {"rgb_camera", "MER2-302-56U3C"},
-            {"rgb_pixel_format", "BayerRG8"},
-            {"rgb_camera_timestamp_units", "native_ticks_unscaled"},
+            {"rgb_camera", session.settings.recordRgb ? "MER2-302-56U3C" : ""},
+            {"rgb_pixel_format", session.settings.recordRgb ? "BayerRG8" : ""},
+            {"rgb_camera_timestamp_units", session.settings.recordRgb ? "native_ticks_unscaled" : ""},
             {"rgb_serial", QString::fromStdString(session.rgb.serial)},
             {"rgb_start_utc", QString::fromStdString(session.rgb.startUtc)},
             {"rgb_end_utc", QString::fromStdString(session.rgb.endUtc)},
@@ -520,29 +540,47 @@ private:
         }
 
         QStringList report{
-            "# DVXplorer + Daheng recording report", "",
+            "# Camera recording report", "",
             QString("- Recording: `%1`").arg(QString::fromStdString(session.file.filename().string())),
-            QString("- Camera: %1").arg(session.cameraName),
+            QString("- Sources: %1").arg(session.settings.recordEvents && session.settings.recordRgb
+                ? "DVXplorer events + Daheng RGB" : session.settings.recordEvents
+                    ? "DVXplorer events" : "Daheng RGB"),
+            QString("- DVXplorer camera: %1").arg(session.settings.recordEvents
+                ? session.cameraName : "not recorded"),
             QString("- Outcome: %1").arg(state),
             QString("- Start (UTC): %1").arg(session.startUtc),
             QString("- End (UTC): %1").arg(session.endUtc),
             QString("- Report generated (UTC): %1").arg(utcNow()),
-            QString("- Recorded events: %1").arg(groupedCount(session.events)),
-            QString("- Recorded triggers: %1").arg(groupedCount(session.triggers)),
-            QString("- RGB camera: MER2-302-56U3C (%1)").arg(QString::fromStdString(session.rgb.serial)),
-            QString("- RGB frames: %1").arg(groupedCount(session.rgb.frames)),
-            QString("- RGB missing frame IDs / incomplete frames / queue overflows: %1 / %2 / %3")
-                .arg(groupedCount(session.rgb.missingFrameIds),
-                    groupedCount(session.rgb.incompleteFrames), groupedCount(session.rgb.queueOverflows)),
-            QString("- RGB raw / frame index: `%1` / `%2`")
-                .arg(QString::fromStdString(session.rgbRawFile.filename().string()),
-                     QString::fromStdString(session.rgbIndexFile.filename().string())),
-            QString("- RGB capture start/end (UTC): %1 / %2")
-                .arg(QString::fromStdString(session.rgb.startUtc), QString::fromStdString(session.rgb.endUtc)),
+            QString("- Recorded events: %1").arg(session.settings.recordEvents
+                ? groupedCount(session.events) : "not recorded"),
+            QString("- Recorded triggers: %1").arg(session.settings.recordEvents
+                ? groupedCount(session.triggers) : "not recorded"),
+            QString("- RGB camera: %1").arg(session.settings.recordRgb
+                ? "MER2-302-56U3C (" + QString::fromStdString(session.rgb.serial) + ")"
+                : "not recorded"),
+            QString("- RGB frames: %1").arg(session.settings.recordRgb
+                ? groupedCount(session.rgb.frames) : "not recorded"),
+            QString("- RGB missing frame IDs / incomplete frames / queue overflows: %1")
+                .arg(session.settings.recordRgb
+                    ? QString("%1 / %2 / %3").arg(groupedCount(session.rgb.missingFrameIds),
+                        groupedCount(session.rgb.incompleteFrames), groupedCount(session.rgb.queueOverflows))
+                    : "not recorded"),
+            session.settings.recordRgb
+                ? QString("- RGB raw / frame index: `%1` / `%2`")
+                    .arg(QString::fromStdString(session.rgbRawFile.filename().string()),
+                         QString::fromStdString(session.rgbIndexFile.filename().string()))
+                : QString("- RGB raw / frame index: not recorded"),
+            session.settings.recordRgb
+                ? QString("- RGB capture start/end (UTC): %1 / %2")
+                    .arg(QString::fromStdString(session.rgb.startUtc), QString::fromStdString(session.rgb.endUtc))
+                : QString("- RGB capture: not recorded"),
             QString("- Peak recorded events in a one-second camera-timestamp bin: %1")
-                .arg(groupedCount(session.peakEventsPerSecond)),
-            QString("- AEDAT4 size: %1 bytes").arg(completedFileSize(session.file)),
-            QString("- Writer finalization: %1 ms").arg(session.finalizeMs
+                .arg(session.settings.recordEvents
+                    ? groupedCount(session.peakEventsPerSecond) : "not recorded"),
+            session.settings.recordEvents
+                ? QString("- AEDAT4 size: %1 bytes").arg(completedFileSize(session.file))
+                : QString("- AEDAT4: not recorded"),
+            QString("- AEDAT4 writer finalization: %1 ms").arg(session.finalizeMs
                 ? QString::number(*session.finalizeMs, 'f', 2) : "unavailable"),
             QString("- Max relative capture lag: %1 ms").arg(session.maxCaptureLagMs
                 ? QString::number(*session.maxCaptureLagMs, 'f', 2) : "unavailable"),
@@ -593,7 +631,10 @@ private:
             }
         }
         report << "" << "## Peak event-intake interval" << "";
-        if (peakSampleValues.isEmpty()) {
+        if (!session.settings.recordEvents) {
+            report << "Event recording was disabled for this session.";
+        }
+        else if (peakSampleValues.isEmpty()) {
             report << "No monitoring interval with a measured event rate is available."
                 << "Enable at least one monitoring option to capture a same-interval metric snapshot.";
         }
@@ -623,7 +664,7 @@ private:
             << "Lost-event totals and rates are unavailable through this recorder's camera interface; blank values do not mean zero loss."
             << "File growth and Linux write counts can reflect buffering; device writes include other processes."
             << "Relative capture lag is a change from the first event batch, not absolute sensor latency."
-            << "RGB frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss. RGB and DVXplorer camera clocks are independent without an external electrical sync signal."
+            << "When RGB is recorded, frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss. When both sources are recorded, their camera clocks are independent without an external electrical sync signal."
             << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
             << "";
 
@@ -640,9 +681,7 @@ private:
     void run() {
         Settings current = initial_;
         while (true) {
-            if (popCommands().quit) {
-                return;
-            }
+            { std::lock_guard lock(commandsMutex_); if (quit_) return; }
 
             std::optional<dv::io::MonoCameraWriter> writer;
             std::unique_ptr<RgbRecorder> rgb;
@@ -656,21 +695,33 @@ private:
             std::optional<Session> session;
             std::optional<std::ofstream> monitorLog;
             try {
-                dv::io::camera::DVXplorer camera{};
-                configure(camera, current);
-                const auto resolution = camera.getEventResolution();
-                if (!resolution || resolution->width <= 0 || resolution->height <= 0) {
-                    throw std::runtime_error("DVXplorer did not report an event resolution");
-                }
-                emit cameraStatus(QString("Ready: %1 (%2 x %3)")
-                    .arg(QString::fromStdString(camera.getCameraName()))
-                    .arg(resolution->width).arg(resolution->height), true);
-
+                std::unique_ptr<dv::io::camera::DVXplorer> camera;
+                int eventWidth = 0, eventHeight = 0;
                 QImage preview;
-                if (previewEnabled_) {
-                    preview = QImage(resolution->width, resolution->height, QImage::Format_RGB888);
-                    preview.fill(Qt::black);
+                auto connectCamera = [&](const Settings &settings) {
+                    auto candidate = std::make_unique<dv::io::camera::DVXplorer>();
+                    configure(*candidate, settings);
+                    const auto resolution = candidate->getEventResolution();
+                    if (!resolution || resolution->width <= 0 || resolution->height <= 0)
+                        throw std::runtime_error("DVXplorer did not report an event resolution");
+                    eventWidth = resolution->width;
+                    eventHeight = resolution->height;
+                    if (previewEnabled_) {
+                        preview = QImage(eventWidth, eventHeight, QImage::Format_RGB888);
+                        preview.fill(Qt::black);
+                    }
+                    camera = std::move(candidate);
+                    emit cameraStatus(QString("Ready: %1 (%2 x %3)")
+                        .arg(QString::fromStdString(camera->getCameraName()))
+                        .arg(eventWidth).arg(eventHeight), true);
+                };
+                if (current.recordEvents) {
+                    try { connectCamera(current); }
+                    catch (const std::exception &e) {
+                        emit cameraStatus(QString("DVXplorer unavailable: %1; retrying").arg(e.what()), false);
+                    }
                 }
+                else emit cameraStatus("Ready: RGB recording (DVXplorer not required)", true);
                 auto lastPreview = std::chrono::steady_clock::now();
                 auto lastStatistics = lastPreview;
                 auto lastDiskCheck = lastPreview;
@@ -678,6 +729,8 @@ private:
                 auto sessionStart = lastPreview;
                 auto lastLoopStart = lastPreview;
                 auto nextRgbPreviewAttempt = lastPreview;
+                auto nextDvAttempt = lastPreview + 2s;
+                bool previewRgb = current.recordRgb && !current.recordEvents;
                 const auto rgbPreviewCallback = [this](RgbRecorder::Preview frame) {
                     publishRgbPreview(std::move(frame));
                 };
@@ -744,7 +797,7 @@ private:
                                 / (1024.0 * 1024.0) / elapsed;
                         }
                         previousWrittenBytes = writtenNow;
-                        if (session) {
+                        if (session && session->settings.recordEvents) {
                             std::error_code error;
                             const auto bytes = fs::file_size(session->file, error);
                             if (!error) {
@@ -783,22 +836,24 @@ private:
                         deviceWriteMiBs.reset();
                         deviceBusyPercent.reset();
                     }
-                    const std::optional<double> eventRate = shortFinalSample ? std::nullopt
-                        : std::optional<double>(session ? (session->events - previousEvents) / elapsed : 0);
-                    const std::optional<double> triggerRate = shortFinalSample ? std::nullopt
-                        : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
+                    const std::optional<double> eventRate = shortFinalSample || (session && !session->settings.recordEvents)
+                        ? std::nullopt : std::optional<double>(session ? (session->events - previousEvents) / elapsed : 0);
+                    const std::optional<double> triggerRate = shortFinalSample || (session && !session->settings.recordEvents)
+                        ? std::nullopt : std::optional<double>(session ? (session->triggers - previousTriggers) / elapsed : 0);
                     const auto rgbNow = rgb ? rgb->snapshot() : (session ? session->rgb : RgbRecorder::Summary{});
-                    const std::optional<double> rgbRate = shortFinalSample || !session
+                    const std::optional<double> rgbRate = shortFinalSample || !session || !session->settings.recordRgb
                         || rgbNow.frames < previousRgbFrames ? std::nullopt
                         : std::optional<double>((rgbNow.frames - previousRgbFrames) / elapsed);
-                    const std::optional<double> rgbMiBs = shortFinalSample || !session
+                    const std::optional<double> rgbMiBs = shortFinalSample || !session || !session->settings.recordRgb
                         || rgbNow.bytes < previousRgbBytes ? std::nullopt
                         : std::optional<double>((rgbNow.bytes - previousRgbBytes)
                             / (1024.0 * 1024.0) / elapsed);
                     QStringList summary;
                     if (current.performanceMonitoring) {
-                        summary << QString("Recorded events: %1/s | Pi CPU used by app: %2%")
-                            .arg(eventRate ? groupedCount(static_cast<quint64>(std::llround(*eventRate))) : "n/a")
+                        summary << QString("%1 | Pi CPU used by app: %2%")
+                            .arg(session && !session->settings.recordEvents ? "Events not recorded"
+                                : "Recorded events: " + (eventRate
+                                    ? groupedCount(static_cast<quint64>(std::llround(*eventRate))) : "n/a") + "/s")
                             .arg(processCpu ? QString::number(*processCpu, 'f', 0) : "n/a");
                         summary << QString("Longest gap between capture checks: %1 ms | App RAM: %2 MiB")
                             .arg(QString::number(maxPollGapMs, 'f', 1))
@@ -819,7 +874,7 @@ private:
                             .arg(latestCaptureLagMs ? QString::number(*latestCaptureLagMs, 'f', 1) : "n/a");
                         summary << "Lost events: unavailable (total and per second)";
                     }
-                    if (session) {
+                    if (session && session->settings.recordRgb) {
                         summary << QString("RGB: %1 frames/s | raw written: %2 MiB/s | missing IDs: %3")
                             .arg(rgbRate ? QString::number(*rgbRate, 'f', 1) : "n/a")
                             .arg(rgbMiBs ? QString::number(*rgbMiBs, 'f', 1) : "n/a")
@@ -832,7 +887,8 @@ private:
                     if (session && monitorLog) {
                         *monitorLog << utcNow().toStdString() << ','
                             << std::chrono::duration<double>(now - sessionStart).count() << ','
-                            << session->events << ',' << session->triggers << ','
+                            << (session->settings.recordEvents ? std::to_string(session->events) : "") << ','
+                            << (session->settings.recordEvents ? std::to_string(session->triggers) : "") << ','
                             << csvNumber(eventRate) << ',' << csvNumber(triggerRate) << ','
                             << csvNumber(processCpu) << ',' << csvNumber(systemCpu) << ','
                             << csvNumber(rssMiB) << ',' << csvNumber(frequencyMHz) << ','
@@ -840,18 +896,21 @@ private:
                             << csvNumber(temperatureC) << ','
                             << (current.storageMonitoring ? csvNumber(lastDiskFreeMiB) : "") << ','
                             << csvNumber(fileMiBs) << ',' << csvNumber(writeMiBs) << ','
-                            << (current.storageMonitoring ? csvNumber(maxWriterCallMs) : "") << ','
-                            << (current.storageMonitoring ? csvNumber(writerTimeMs) : "") << ','
+                            << (current.storageMonitoring && session->settings.recordEvents ? csvNumber(maxWriterCallMs) : "") << ','
+                            << (current.storageMonitoring && session->settings.recordEvents ? csvNumber(writerTimeMs) : "") << ','
                             << csvNumber(dirtyMiB) << ',' << csvNumber(writebackMiB) << ','
                             << csvNumber(ioPressure) << ',' << csvNumber(deviceWriteMiBs) << ','
                             << csvNumber(deviceBusyPercent) << ','
                             << (session->finalizeMs ? csvNumber(*session->finalizeMs) : "") << ','
-                            << session->peakEventsPerSecond << ','
-                            << (current.storageMonitoring ? csvNumber(latestCaptureLagMs) : "")
-                            << ",,," << (current.storageMonitoring ? "unavailable" : "disabled") << ','
-                            << rgbNow.frames << ',' << csvNumber(rgbRate) << ',' << csvNumber(rgbMiBs)
-                            << ',' << rgbNow.missingFrameIds << ',' << rgbNow.incompleteFrames
-                            << ',' << rgbNow.queueOverflows << '\n'
+                            << (session->settings.recordEvents ? std::to_string(session->peakEventsPerSecond) : "") << ','
+                            << (current.storageMonitoring && session->settings.recordEvents ? csvNumber(latestCaptureLagMs) : "")
+                            << ",,," << (session->settings.recordEvents
+                                ? (current.storageMonitoring ? "unavailable" : "disabled") : "not_recorded") << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.frames) : "") << ','
+                            << csvNumber(rgbRate) << ',' << csvNumber(rgbMiBs) << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.missingFrameIds) : "") << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.incompleteFrames) : "") << ','
+                            << (session->settings.recordRgb ? std::to_string(rgbNow.queueOverflows) : "") << '\n'
                             << std::flush;
                         if (!monitorLog->good()) {
                             session->monitorError = "Monitoring CSV write failed";
@@ -870,7 +929,7 @@ private:
                 };
 
                 auto finish = [&](const QString &state, const QString &reason = QString{}) {
-                    if (!writer) {
+                    if (!session) {
                         return;
                     }
                     QString outcome = state;
@@ -892,10 +951,12 @@ private:
                         rgb.reset();
                     }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
-                    writer.reset(); // AEDAT4 index and buffered packets are finalized here.
+                    if (writer) {
+                        writer.reset(); // AEDAT4 index and buffered packets are finalized here.
+                        session->finalizeMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - beforeFinalize).count();
+                    }
                     session->endUtc = utcNow();
-                    session->finalizeMs = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - beforeFinalize).count();
                     sampleMonitor(std::chrono::steady_clock::now(), true);
                     monitorLog.reset();
                     try {
@@ -913,21 +974,40 @@ private:
                     }
                     const QString path = QString::fromStdString(session->file.string());
                     emit recordingState(false, outcome == "complete"
-                        ? QString("Saved %1 | RGB: %2 frames | Peak: %3 recorded events/s | Report: %4")
-                            .arg(path, groupedCount(session->rgb.frames), groupedCount(session->peakEventsPerSecond),
+                        ? QString("Saved %1%2%3 | Report: %4")
+                            .arg(path,
+                                session->settings.recordRgb
+                                    ? " | RGB: " + groupedCount(session->rgb.frames) + " frames" : QString{},
+                                session->settings.recordEvents
+                                    ? " | Peak: " + groupedCount(session->peakEventsPerSecond) + " recorded events/s" : QString{},
                                 session->reportError.isEmpty() ? "saved" : session->reportError)
                         : QString("Recording interrupted: %1 (%2)").arg(detail, path));
                     session.reset();
                 };
 
-                while (camera.isRunning()) {
+                while (true) {
                     const auto loopStart = std::chrono::steady_clock::now();
+                    if (camera && !camera->isRunning()) {
+                        if (session && current.recordEvents)
+                            finish("interrupted", "DVXplorer disconnected");
+                        camera.reset();
+                        nextDvAttempt = loopStart + 2s;
+                        emit cameraStatus(current.recordEvents
+                            ? "DVXplorer disconnected; retrying" : "Ready: RGB recording", !current.recordEvents);
+                    }
+                    if (!camera && current.recordEvents && !session && loopStart >= nextDvAttempt) {
+                        try { connectCamera(current); }
+                        catch (const std::exception &e) {
+                            emit cameraStatus(QString("DVXplorer unavailable: %1; retrying").arg(e.what()), false);
+                        }
+                        nextDvAttempt = loopStart + 2s;
+                    }
                     if (session && current.performanceMonitoring) {
                         maxPollGapMs = std::max(maxPollGapMs,
                             std::chrono::duration<double, std::milli>(loopStart - lastLoopStart).count());
                     }
                     lastLoopStart = loopStart;
-                    if (!writer && !rgb && rgbPreview && !rgbPreview->snapshot().error.empty()) {
+                    if (!session && rgbPreview && !rgbPreview->snapshot().error.empty()) {
                         emit rgbCameraStatus("RGB preview stopped: "
                             + QString::fromStdString(rgbPreview->snapshot().error));
                         rgbPreview.reset();
@@ -950,7 +1030,7 @@ private:
                             nextRgbPreviewAttempt = loopStart + 10s;
                         }
                     }
-                    if (previewEnabled_ && !writer && !rgb && !rgbPreview
+                    if (previewEnabled_ && previewRgb && current.recordRgb && !session && !rgbPreview
                         && !rgbPreviewAttempt.valid() && loopStart >= nextRgbPreviewAttempt) {
                         try {
                             rgbPreviewAttemptSerial = current.rgbSerial;
@@ -982,15 +1062,39 @@ private:
                     if (commands.stop) {
                         finish("complete");
                     }
-                    if (commands.apply && !writer) {
+                    if (commands.previewRgb && !session) {
+                        const bool selected = *commands.previewRgb;
+                        if ((selected && current.recordRgb) || (!selected && current.recordEvents)) {
+                            previewRgb = selected;
+                            if (!previewRgb) {
+                                if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
+                                rgbPreview.reset();
+                            }
+                            QMutexLocker eventsLock(&previewMutex_);
+                            latestPreview_ = {};
+                            QMutexLocker rgbLock(&rgbPreviewMutex_);
+                            latestRgbPreview_ = {};
+                            emit rgbCameraStatus(previewRgb ? "Connecting to Daheng..." : "RGB preview idle");
+                        }
+                    }
+                    if (commands.apply && !session) {
                         try {
-                            if (current.rgbSerial != commands.apply->rgbSerial) {
+                            if (!commands.apply->recordEvents && !commands.apply->recordRgb)
+                                throw std::runtime_error("Enable RGB, events, or both");
+                            if (current.rgbSerial != commands.apply->rgbSerial
+                                || !commands.apply->recordRgb) {
                                 if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                                 rgbPreview.reset();
                                 nextRgbPreviewAttempt = loopStart;
                             }
-                            configure(camera, *commands.apply);
+                            if (commands.apply->recordEvents) {
+                                if (!camera) connectCamera(*commands.apply);
+                                else configure(*camera, *commands.apply);
+                            }
+                            else camera.reset();
                             current = *commands.apply;
+                            if (!current.recordEvents) previewRgb = true;
+                            if (!current.recordRgb) previewRgb = false;
                             lastMonitoring = std::chrono::steady_clock::now();
                             previousCpuClock = std::clock();
                             previousSystemTicks = current.performanceMonitoring
@@ -1001,15 +1105,22 @@ private:
                             previousBlockStats.reset();
                             emit monitoring(current.performanceMonitoring || current.temperatureMonitoring
                                 || current.storageMonitoring ? "Monitoring enabled" : "Monitoring off");
+                            if (!current.recordEvents)
+                                emit cameraStatus("Ready: RGB recording (DVXplorer not required)", true);
+                            if (!current.recordRgb) emit rgbCameraStatus("RGB recording disabled");
                             emit settingsApplied(true, "Camera settings applied");
                         }
                         catch (const std::exception &e) {
                             emit settingsApplied(false, QString("Settings failed: %1").arg(e.what()));
                         }
                     }
-                    if (commands.start && !writer) {
+                    if (commands.start && !session) {
                         try {
-                            configure(camera, *commands.start);
+                            if (!commands.start->recordEvents && !commands.start->recordRgb)
+                                throw std::runtime_error("Enable RGB, events, or both");
+                            if (commands.start->recordEvents && !camera)
+                                throw std::runtime_error("DVXplorer is not connected");
+                            if (camera && commands.start->recordEvents) configure(*camera, *commands.start);
                             current = *commands.start;
                             const fs::path directory = nativePath(current.outputDirectory);
                             fs::create_directories(directory);
@@ -1021,8 +1132,9 @@ private:
                             fs::path output;
                             const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyyMMddTHHmmsszzzZ");
                             for (unsigned index = 0;; ++index) {
-                                const QString name = "DVXplorer_" + stamp
-                                    + (index ? "_" + QString::number(index) : QString{}) + ".aedat4";
+                                const QString name = (current.recordEvents ? "DVXplorer_" : "Daheng_") + stamp
+                                    + (index ? "_" + QString::number(index) : QString{})
+                                    + (current.recordEvents ? ".aedat4" : "");
                                 output = directory / nativePath(name);
                                 if (!fs::exists(output) && !fs::exists(output.string() + ".rgb.raw")
                                     && !fs::exists(output.string() + ".rgb.frames.csv")
@@ -1034,21 +1146,25 @@ private:
                             }
                             if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
-                            writer.emplace(output.string(), camera);
-                            session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
-                            rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
-                                previewEnabled_ ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
-                            rgb->start();
-                            emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
-                            session->rgbRawFile = rgb->rawPath();
-                            session->rgbIndexFile = rgb->indexPath();
-                            session->rgb = rgb->snapshot();
+                            if (current.recordEvents) writer.emplace(output.string(), *camera);
+                            session = Session{output, current,
+                                current.recordEvents ? QString::fromStdString(camera->getCameraName()) : QString{}, utcNow()};
+                            if (current.recordRgb) {
+                                rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
+                                    previewEnabled_ && previewRgb ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
+                                rgb->start();
+                                emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
+                                session->rgbRawFile = rgb->rawPath();
+                                session->rgbIndexFile = rgb->indexPath();
+                                session->rgb = rgb->snapshot();
+                            }
+                            else emit rgbCameraStatus("RGB recording disabled");
                             session->startUtc = utcNow();
                             session->reportFile = fs::path(output.string() + ".report.md");
+                            session->storageDeviceName = storageDevice(directory);
                             if (current.performanceMonitoring || current.temperatureMonitoring
                                 || current.storageMonitoring) {
                                 session->monitorFile = fs::path(output.string() + ".monitor.csv");
-                                session->storageDeviceName = storageDevice(directory);
                                 if (current.storageMonitoring) {
                                     const auto device = blockDeviceSysfsPath(directory);
                                     blockStatsFile = device.empty() ? fs::path{} : device / "stat";
@@ -1113,7 +1229,8 @@ private:
                         }
                     }
 
-                    if (auto events = camera.getNextEventBatch(); events && !events->isEmpty()) {
+                    if (camera) {
+                    if (auto events = camera->getNextEventBatch(); events && !events->isEmpty()) {
                         if (writer) {
                             const auto beforeWrite = current.storageMonitoring
                                 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1143,7 +1260,7 @@ private:
                             }
                         }
                         // Camera-timestamp peak counting remains active without a display.
-                        const size_t stride = previewEnabled_
+                        const size_t stride = previewEnabled_ && !previewRgb
                             ? std::max<size_t>(1, events->size() / 12000) : 0;
                         size_t position = 0;
                         for (const auto &event : *events) {
@@ -1163,12 +1280,12 @@ private:
                                 session->peakEventsPerSecond = std::max(
                                     session->peakEventsPerSecond, ++eventSecondCount);
                             }
-                            if (!previewEnabled_) continue;
+                            if (!previewEnabled_ || previewRgb) continue;
                             if (position++ % stride != 0) {
                                 continue;
                             }
-                            if (event.x() >= 0 && event.y() >= 0 && event.x() < resolution->width
-                                && event.y() < resolution->height) {
+                            if (event.x() >= 0 && event.y() >= 0 && event.x() < eventWidth
+                                && event.y() < eventHeight) {
                                 auto *pixel = preview.scanLine(event.y()) + event.x() * 3;
                                 if (event.polarity()) {
                                     pixel[0] = 30; pixel[1] = 205; pixel[2] = 255;
@@ -1179,7 +1296,7 @@ private:
                             }
                         }
                     }
-                    if (auto triggers = camera.getNextTriggerBatch(); triggers && !triggers->empty()) {
+                    if (auto triggers = camera->getNextTriggerBatch(); triggers && !triggers->empty()) {
                         if (writer) {
                             const auto beforeWrite = current.storageMonitoring
                                 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1195,19 +1312,20 @@ private:
                             }
                         }
                     }
+                    }
 
                     const auto now = std::chrono::steady_clock::now();
-                    if (previewEnabled_
+                    if (camera && previewEnabled_ && !previewRgb
                         && now - lastPreview >= std::chrono::milliseconds(current.previewIntervalMs)) {
                         {
                             QMutexLocker lock(&previewMutex_);
                             latestPreview_ = std::move(preview);
                         }
-                        preview = QImage(resolution->width, resolution->height, QImage::Format_RGB888);
+                        preview = QImage(eventWidth, eventHeight, QImage::Format_RGB888);
                         preview.fill(Qt::black);
                         lastPreview = now;
                     }
-                    if (writer && now - lastStatistics >= 500ms) {
+                    if (session && now - lastStatistics >= 500ms) {
                         emit statistics(session->events, session->triggers);
                         if (rgb) {
                             const auto summary = rgb->snapshot();
@@ -1216,7 +1334,7 @@ private:
                         }
                         lastStatistics = now;
                     }
-                    if (writer && now - lastDiskCheck >= 500ms) {
+                    if (session && now - lastDiskCheck >= 500ms) {
                         const auto availableBytes = fs::space(session->file.parent_path()).available;
                         lastDiskFreeMiB = availableBytes / (1024.0 * 1024.0);
                         if (availableBytes < 1ULL * 1024 * 1024 * 1024) {
@@ -1225,25 +1343,24 @@ private:
                         lastDiskCheck = now;
                     }
                     sampleMonitor(now);
-                    if (now - lastPreview < 2ms) {
+                    if (!camera || previewRgb || now - lastPreview < 2ms) {
                         std::this_thread::sleep_for(1ms);
                     }
                 }
-                finish("interrupted", "Camera disconnected");
-                emit cameraStatus("Camera disconnected; retrying", false);
             }
             catch (const std::exception &e) {
                 const QString error = QString::fromUtf8(e.what());
-                if (writer && session) {
+                if (session) {
                     // Capture the failure interval before draining queued RGB frames.
                     // Without this, an early interruption can leave a header-only CSV.
                     sampleMonitor(std::chrono::steady_clock::now(), true);
                     if (rgb) { session->rgb = rgb->stop(); rgb.reset(); }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
-                    writer.reset();
+                    if (writer) writer.reset();
                     session->endUtc = utcNow();
-                    session->finalizeMs = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - beforeFinalize).count();
+                    if (session->settings.recordEvents)
+                        session->finalizeMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - beforeFinalize).count();
                     // Record final counters after the RGB queue and AEDAT4 writer close.
                     sampleMonitor(std::chrono::steady_clock::now(), true);
                     monitorLog.reset();
@@ -1281,6 +1398,7 @@ private:
     const bool previewEnabled_;
     std::optional<Settings> apply_;
     std::optional<Settings> start_;
+    std::optional<bool> previewSelection_;
     bool stop_ = false;
     bool quit_ = false;
     QMutex previewMutex_;
@@ -1302,26 +1420,15 @@ public:
 
         auto *live = new QWidget(this);
         auto *liveLayout = new QVBoxLayout(live);
-        auto *previewRow = new QHBoxLayout;
-        auto *dvsPanel = new QVBoxLayout;
-        auto *rgbPanel = new QVBoxLayout;
-        dvsPanel->addWidget(new QLabel("DVXplorer events", live));
-        preview_ = new QLabel("Waiting for DVXplorer...", live);
+        previewTitle_ = new QLabel(live);
+        liveLayout->addWidget(previewTitle_);
+        preview_ = new QLabel(live);
         preview_->setAlignment(Qt::AlignCenter);
-        preview_->setMinimumSize(220, 150);
+        preview_->setWordWrap(true);
+        preview_->setMargin(12);
+        preview_->setMinimumSize(440, 300);
         preview_->setStyleSheet("background:#101317;color:white;font-size:20px");
-        dvsPanel->addWidget(preview_, 1);
-        rgbPanel->addWidget(new QLabel("Daheng RGB", live));
-        rgbPreview_ = new QLabel("Connecting to Daheng...", live);
-        rgbPreview_->setAlignment(Qt::AlignCenter);
-        rgbPreview_->setWordWrap(true);
-        rgbPreview_->setMargin(12);
-        rgbPreview_->setMinimumSize(220, 150);
-        rgbPreview_->setStyleSheet("background:#101317;color:white;font-size:20px");
-        rgbPanel->addWidget(rgbPreview_, 1);
-        previewRow->addLayout(dvsPanel, 1);
-        previewRow->addLayout(rgbPanel, 1);
-        liveLayout->addLayout(previewRow, 1);
+        liveLayout->addWidget(preview_, 1);
         status_ = new QLabel("Connecting to DVXplorer...", live);
         status_->setWordWrap(true);
         liveLayout->addWidget(status_);
@@ -1337,10 +1444,13 @@ public:
         liveLayout->addWidget(monitorStatus_);
         auto *buttons = new QHBoxLayout;
         record_ = new QPushButton("Start recording", live);
+        previewButton_ = new QPushButton(live);
         settingsButton_ = new QPushButton("Settings", live);
         record_->setMinimumHeight(52);
+        previewButton_->setMinimumHeight(52);
         settingsButton_->setMinimumHeight(52);
         buttons->addWidget(record_);
+        buttons->addWidget(previewButton_);
         buttons->addWidget(settingsButton_);
         liveLayout->addLayout(buttons);
         pages_->addWidget(live);
@@ -1362,6 +1472,8 @@ public:
         on_ = spin(0, 17, 9, formContainer);
         off_ = spin(0, 17, 9, formContainer);
         interval_ = spin(33, 250, 50, formContainer);
+        recordEvents_ = new QCheckBox("Record DVXplorer events and triggers", formContainer);
+        recordRgb_ = new QCheckBox("Record Daheng RGB frames", formContainer);
         performance_ = new QCheckBox("Performance monitoring (CPU, memory, event rate, loop delays)", formContainer);
         temperature_ = new QCheckBox("Temperature monitoring", formContainer);
         storage_ = new QCheckBox("Storage monitoring (write rate, stalls, disk backlog)", formContainer);
@@ -1371,13 +1483,15 @@ public:
         form->addRow("ON contrast (0-17)", on_);
         form->addRow("OFF contrast (0-17)", off_);
         form->addRow("Preview interval (ms)", interval_);
+        form->addRow(recordEvents_);
+        form->addRow(recordRgb_);
         form->addRow("RGB serial (optional)", rgbSerial_);
         form->addRow(performance_);
         form->addRow(temperature_);
         form->addRow(storage_);
         auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
-            "RGB frames are saved as uncompressed BayerRG8 with a frame index. Both cameras are required to record. "
-            "Monitoring samples once per second and saves a CSV beside the AEDAT4. "
+            "Select at least one recording source. RGB frames are saved as uncompressed BayerRG8 with a frame index. "
+            "Only the selected camera is previewed. Monitoring samples once per second and saves a CSV beside the recording. "
             "Settings are locked during recording.", formContainer);
         note->setWordWrap(true);
         form->addRow(note);
@@ -1406,6 +1520,11 @@ public:
         });
         connect(apply_, &QPushButton::clicked, this, [this] {
             Settings draft = readSettings();
+            if (!draft.recordEvents && !draft.recordRgb) {
+                status_->setText("Enable RGB, events, or both in Settings");
+                pages_->setCurrentIndex(0);
+                return;
+            }
             if (draft.outputDirectory.trimmed().isEmpty()) {
                 status_->setText("Choose a recording directory");
                 pages_->setCurrentIndex(0);
@@ -1421,7 +1540,7 @@ public:
         connect(record_, &QPushButton::clicked, this, [this] {
             if (recording_) {
                 record_->setEnabled(false);
-                status_->setText("Finalizing DVXplorer and RGB files...");
+                status_->setText("Finalizing recording...");
                 recorder_.stop();
             }
             else if (ready_ && !busy_) {
@@ -1430,6 +1549,16 @@ public:
                 status_->setText("Starting recording...");
                 recorder_.start(settings_);
             }
+        });
+        previewRgb_ = settings_.recordRgb && !settings_.recordEvents;
+        recorder_.selectPreview(previewRgb_);
+        refreshPreview();
+        connect(previewButton_, &QPushButton::clicked, this, [this] {
+            if (recording_ || busy_ || !settings_.recordEvents || !settings_.recordRgb) return;
+            previewRgb_ = !previewRgb_;
+            recorder_.selectPreview(previewRgb_);
+            refreshPreview();
+            updateButtons();
         });
 
         connect(&recorder_, &Recorder::cameraStatus, this, [this](const QString &message, bool ready) {
@@ -1446,10 +1575,10 @@ public:
         });
         connect(&recorder_, &Recorder::rgbCameraStatus, this, [this](const QString &message) {
             rgbStatus_->setText(message);
-            if (!message.startsWith("RGB live:")) {
-                lastRgbImage_ = {};
-                rgbPreview_->clear();
-                rgbPreview_->setText(message.startsWith("RGB recording:")
+            if (previewRgb_ && !message.startsWith("RGB live:")) {
+                lastImage_ = {};
+                preview_->clear();
+                preview_->setText(message.startsWith("RGB recording:")
                     ? "Waiting for RGB frames..." : message);
             }
         });
@@ -1458,17 +1587,27 @@ public:
             if (success && pendingSettings_) {
                 settings_ = *pendingSettings_;
                 saveSettings(settings_);
+                if (!settings_.recordEvents) previewRgb_ = true;
+                if (!settings_.recordRgb) previewRgb_ = false;
+                recorder_.selectPreview(previewRgb_);
+                refreshPreview();
+                if (!settings_.recordEvents) counts_->setText("DVXplorer events: not recorded");
+                else counts_->setText("Events: 0 | Triggers: 0");
+                if (!settings_.recordRgb) rgbCounts_->setText("RGB frames: not recorded");
+                else rgbCounts_->setText("RGB: 0 frames | Missing IDs: 0 | Incomplete: 0");
             }
             pendingSettings_.reset();
             status_->setText(message);
             updateButtons();
         });
         connect(&recorder_, &Recorder::statistics, this, [this](quint64 events, quint64 triggers) {
+            if (!settings_.recordEvents) return;
             counts_->setText(QString("Events: %1 | Triggers: %2")
                 .arg(groupedCount(events), groupedCount(triggers)));
         });
         connect(&recorder_, &Recorder::rgbStatistics, this,
             [this](quint64 frames, quint64 missing, quint64 incomplete) {
+                if (!settings_.recordRgb) return;
                 rgbCounts_->setText(QString("RGB: %1 frames | Missing IDs: %2 | Incomplete: %3")
                     .arg(groupedCount(frames), groupedCount(missing), groupedCount(incomplete)));
             });
@@ -1478,17 +1617,14 @@ public:
         auto *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this] {
             QImage image;
-            if (recorder_.takePreview(image)) {
+            if ((previewRgb_ ? recorder_.takeRgbPreview(image) : recorder_.takePreview(image))) {
                 lastImage_ = QPixmap::fromImage(std::move(image));
                 preview_->setPixmap(lastImage_.scaled(preview_->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
             }
-            if (recorder_.takeRgbPreview(image)) {
-                lastRgbImage_ = QPixmap::fromImage(std::move(image));
-                rgbPreview_->setPixmap(lastRgbImage_.scaled(rgbPreview_->size(),
-                    Qt::KeepAspectRatio, Qt::FastTransformation));
-            }
         });
         timer->start(50);
+        if (!settings_.recordEvents) counts_->setText("DVXplorer events: not recorded");
+        if (!settings_.recordRgb) rgbCounts_->setText("RGB frames: not recorded");
         updateButtons();
     }
 
@@ -1504,7 +1640,7 @@ private:
     Settings readSettings() const {
         return {output_->text().trimmed(), on_->value(), off_->value(), interval_->value(),
             performance_->isChecked(), temperature_->isChecked(), storage_->isChecked(),
-            rgbSerial_->text().trimmed()};
+            rgbSerial_->text().trimmed(), recordEvents_->isChecked(), recordRgb_->isChecked()};
     }
 
     void loadSettings(const Settings &settings) {
@@ -1516,26 +1652,38 @@ private:
         temperature_->setChecked(settings.temperatureMonitoring);
         storage_->setChecked(settings.storageMonitoring);
         rgbSerial_->setText(settings.rgbSerial);
+        recordEvents_->setChecked(settings.recordEvents);
+        recordRgb_->setChecked(settings.recordRgb);
+    }
+
+    void refreshPreview() {
+        lastImage_ = {};
+        preview_->clear();
+        previewTitle_->setText(previewRgb_ ? "Daheng RGB" : "DVXplorer events");
+        preview_->setText(previewRgb_ ? "Waiting for Daheng RGB..." : "Waiting for DVXplorer events...");
     }
 
     void updateButtons() {
         record_->setText(recording_ ? "Stop recording" : "Start recording");
         record_->setEnabled(recording_ || (ready_ && !busy_));
-        settingsButton_->setEnabled(ready_ && !recording_ && !busy_);
+        previewButton_->setText(previewRgb_ ? "Preview: RGB" : "Preview: Events");
+        previewButton_->setEnabled(!recording_ && !busy_ && settings_.recordEvents && settings_.recordRgb);
+        settingsButton_->setEnabled(!recording_ && !busy_);
     }
 
     Recorder &recorder_;
     Settings settings_;
     std::optional<Settings> pendingSettings_;
     QStackedWidget *pages_ = nullptr;
+    QLabel *previewTitle_ = nullptr;
     QLabel *preview_ = nullptr;
-    QLabel *rgbPreview_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *rgbStatus_ = nullptr;
     QLabel *counts_ = nullptr;
     QLabel *rgbCounts_ = nullptr;
     QLabel *monitorStatus_ = nullptr;
     QPushButton *record_ = nullptr;
+    QPushButton *previewButton_ = nullptr;
     QPushButton *settingsButton_ = nullptr;
     QPushButton *apply_ = nullptr;
     QLineEdit *output_ = nullptr;
@@ -1545,9 +1693,11 @@ private:
     QCheckBox *performance_ = nullptr;
     QCheckBox *temperature_ = nullptr;
     QCheckBox *storage_ = nullptr;
+    QCheckBox *recordEvents_ = nullptr;
+    QCheckBox *recordRgb_ = nullptr;
     QLineEdit *rgbSerial_ = nullptr;
     QPixmap lastImage_;
-    QPixmap lastRgbImage_;
+    bool previewRgb_ = false;
     bool ready_ = false;
     bool recording_ = false;
     bool busy_ = false;
@@ -1644,7 +1794,9 @@ int main(int argc, char **argv) {
         });
         signalTimer.start(100);
         recorder.launch();
-        logHeadless("Waiting for DVXplorer; Ctrl+C stops and saves after recording starts.");
+        logHeadless(settings.recordEvents
+            ? "Waiting for DVXplorer; Ctrl+C stops and saves after recording starts."
+            : "Starting RGB-only recording; Ctrl+C stops and saves after recording starts.");
         return application.exec();
     }
     QApplication application(argc, argv);
