@@ -234,6 +234,8 @@ void RgbRecorder::captureLoop() noexcept {
                     }
                     else {
                         queue_.push_back(std::move(item));
+                        summary_.queueDepth = queue_.size();
+                        summary_.maxQueueDepth = std::max(summary_.maxQueueDepth, summary_.queueDepth);
                         previewAllowed = queue_.size() <= 4;
                     }
                 }
@@ -265,6 +267,7 @@ void RgbRecorder::writeLoop() noexcept {
                 if (queue_.empty()) break;
                 item = std::move(queue_.front());
                 queue_.pop_front();
+                summary_.queueDepth = queue_.size();
                 index = summary_.frames;
                 offset = summary_.bytes;
             }
