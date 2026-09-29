@@ -37,6 +37,8 @@ public:
         uint64_t missingFrameIds = 0;
         uint64_t incompleteFrames = 0;
         uint64_t queueOverflows = 0;
+        uint64_t queueDepth = 0;
+        uint64_t maxQueueDepth = 0;
         uint64_t bytes = 0;
         std::string error;
     };
