@@ -13,6 +13,7 @@ This branch records **DVXplorer events and Daheng MER2-302-56U3C frames together
 - Stores the camera name, acquisition parameters, UTC host start/end times, and counts in an adjacent `.aedat4.json` file. Camera timestamps in AEDAT4 are authoritative for event-to-trigger alignment; the host times are operational metadata.
 - Provides a touchscreen-friendly settings screen. Settings and recording directory can be changed only between recordings. The DVXplorer worker owns AEDAT4 capture and preview; separate RGB capture and writer threads share a bounded queue. The Qt GUI runs on its normal thread. No thread is pinned to a core.
 - Remembers successfully applied settings across app restarts on the Pi.
+- Offers `--headless` recording from an SSH terminal: no Qt display, DVXplorer event preview, RGB color conversion, or screen sharing. Capture, monitoring, and saved reports use the same recorder as the GUI.
 - Optional 1 Hz performance, temperature, and storage diagnostics during capture, shown on the live screen and saved beside each recording.
 
 ON/OFF contrast defaults to 9. The recorder applies no software event filtering and saves every event delivered by the DVXplorer.
@@ -61,6 +62,19 @@ Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder aga
 5. Inspect the file with `dv-filestat -v /path/to/file.aedat4` or open it with `dv::io::MonoCameraRecording` / DV GUI. When testing the external trigger wiring, verify the file actually contains trigger events and that the count rises.
 
 The app stops a recording when free space drops below 1 GiB, and refuses to start when less than 2 GiB is available; it checks every 500 ms while recording. An interrupted session is marked in its metadata if the process is still running. Sudden power loss can leave the current AEDAT4 incomplete, so stop and wait for completion before powering down.
+
+### Remote recording over SSH without a desktop
+
+Build as above and choose an existing output directory on the mounted SSD. Check it with `findmnt -T /path/to/ssd/recordings` before recording so you do not accidentally write to the SD card. The headless mode reads the contrast, RGB serial, and three monitoring selections last applied in the GUI for the same Linux user. Its `--output` argument is required and overrides the saved directory for that run.
+
+```bash
+cd ~/Desktop/DVS-RGB-Recording-System
+./build/dvxplorer_recorder --headless --output /path/to/ssd/recordings
+```
+
+It waits for the DVXplorer, then starts both cameras and prints status and any enabled monitoring in the terminal. It does not open a window or construct either live preview. Press **Ctrl+C once** to stop; wait until `Saved ...` appears before shutting down or unplugging the SSD. A start error or interrupted recording exits with a nonzero status.
+
+For a recording that must survive an SSH disconnect, launch the command inside `tmux new -s birds-record`; detach with **Ctrl+B, D** and later run `tmux attach -t birds-record` to return and stop with Ctrl+C. You can inspect `.aedat4.monitor.csv` and `.aedat4.report.md` over SSH while the data files stay on the Pi. Screen sharing is unnecessary and has its own CPU and network overhead. Headless mode still uses camera and writer threads; it does not dedicate or pin a CPU core.
 
 The RGB raw file is tightly packed BayerRG8: each frame has exactly `width × height` bytes with no per-frame header. Use `byte_offset` and `bytes` in the CSV to read a frame, then demosaic BayerRG8 in analysis. The JSON reports resolution, serial, frame count and errors. At full 2048 × 1536 and 56 fps, RGB alone produces about **168 MiB/s** of raw image data (plus DV events). Check the combined SSD throughput and RGB gap/queue-overflow counts. Zero frame-ID gaps cannot prove the sensor itself never missed a frame.
 
