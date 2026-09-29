@@ -1526,8 +1526,14 @@ void logHeadless(const QString &message) {
 
 int main(int argc, char **argv) {
     bool headless = false;
+    bool autostart = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--headless") headless = true;
+        if (std::string_view(argv[i]) == "--autostart") autostart = true;
+    }
+    if (headless && autostart) {
+        std::cerr << "Choose either --headless or --autostart.\n";
+        return 2;
     }
     if (headless) {
         QString output;
@@ -1603,6 +1609,45 @@ int main(int argc, char **argv) {
     const dvxrec::Settings initial = dvxrec::loadSavedSettings();
     dvxrec::Recorder recorder(initial);
     dvxrec::MainWindow window(recorder, initial);
+    bool started = false;
+    bool stopping = false;
+    if (autostart) {
+        QObject::connect(&recorder, &dvxrec::Recorder::cameraStatus, &application,
+            [&](const QString &message, bool ready) {
+                if (ready && !started && !stopping) recorder.start(initial);
+                if (!ready) logHeadless(message);
+            });
+        QObject::connect(&recorder, &dvxrec::Recorder::recordingState, &application,
+            [&](bool recording, const QString &message) {
+                logHeadless(message);
+                if (recording) {
+                    started = true;
+                    if (stopRequested && !stopping) {
+                        stopping = true;
+                        recorder.stop();
+                    }
+                }
+                else {
+                    application.exit(message.startsWith("Saved ") ? 0 : 1);
+                }
+            });
+        std::signal(SIGINT, requestStop);
+        std::signal(SIGTERM, requestStop);
+        auto *signalTimer = new QTimer(&application);
+        QObject::connect(signalTimer, &QTimer::timeout, &application, [&] {
+            if (stopRequested && !stopping) {
+                stopping = true;
+                if (started) {
+                    logHeadless("Stopping and finalizing recording...");
+                    recorder.stop();
+                }
+                else {
+                    application.exit(130);
+                }
+            }
+        });
+        signalTimer->start(100);
+    }
     window.show();
     recorder.launch();
     return application.exec();
