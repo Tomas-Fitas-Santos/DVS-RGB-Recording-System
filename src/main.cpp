@@ -1235,12 +1235,17 @@ private:
             catch (const std::exception &e) {
                 const QString error = QString::fromUtf8(e.what());
                 if (writer && session) {
+                    // Capture the failure interval before draining queued RGB frames.
+                    // Without this, an early interruption can leave a header-only CSV.
+                    sampleMonitor(std::chrono::steady_clock::now(), true);
                     if (rgb) { session->rgb = rgb->stop(); rgb.reset(); }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     writer.reset();
                     session->endUtc = utcNow();
                     session->finalizeMs = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - beforeFinalize).count();
+                    // Record final counters after the RGB queue and AEDAT4 writer close.
+                    sampleMonitor(std::chrono::steady_clock::now(), true);
                     monitorLog.reset();
                     try {
                         saveReport(*session, "interrupted", error);
