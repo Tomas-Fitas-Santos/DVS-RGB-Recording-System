@@ -1424,7 +1424,12 @@ public:
         auto *live = new QWidget(this);
         auto *liveLayout = new QVBoxLayout(live);
         previewTitle_ = new QLabel(live);
-        liveLayout->addWidget(previewTitle_);
+        persistenceButton_ = new QPushButton(live);
+        auto *previewHeader = new QHBoxLayout;
+        previewHeader->addWidget(previewTitle_);
+        previewHeader->addStretch();
+        previewHeader->addWidget(persistenceButton_);
+        liveLayout->addLayout(previewHeader);
         preview_ = new QLabel(live);
         preview_->setAlignment(Qt::AlignCenter);
         preview_->setWordWrap(true);
@@ -1563,6 +1568,13 @@ public:
             refreshPreview();
             updateButtons();
         });
+        connect(persistenceButton_, &QPushButton::clicked, this, [this] {
+            if (previewRgb_ || !settings_.recordEvents) return;
+            eventPersistence_ = !eventPersistence_;
+            persistentEvents_ = {};
+            lastEventComposite_.reset();
+            updateButtons();
+        });
 
         connect(&recorder_, &Recorder::cameraStatus, this, [this](const QString &message, bool ready) {
             ready_ = ready;
@@ -1621,7 +1633,11 @@ public:
         connect(timer, &QTimer::timeout, this, [this] {
             QImage image;
             if ((previewRgb_ ? recorder_.takeRgbPreview(image) : recorder_.takePreview(image))) {
-                lastImage_ = QPixmap::fromImage(std::move(image));
+                if (!previewRgb_ && eventPersistence_) {
+                    compositeEventPreview(image);
+                    lastImage_ = QPixmap::fromImage(persistentEvents_);
+                }
+                else lastImage_ = QPixmap::fromImage(std::move(image));
                 preview_->setPixmap(lastImage_.scaled(preview_->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
             }
         });
@@ -1632,6 +1648,37 @@ public:
     }
 
 private:
+    // Compose only on the Qt display thread. The camera and AEDAT4 writer do
+    // exactly the same work whether this visual aid is enabled or not.
+    void compositeEventPreview(const QImage &incoming) {
+        const auto now = std::chrono::steady_clock::now();
+        if (persistentEvents_.size() != incoming.size()
+            || persistentEvents_.format() != incoming.format() || !lastEventComposite_) {
+            persistentEvents_ = incoming.copy();
+            lastEventComposite_ = now;
+            return;
+        }
+        const double elapsedMs = std::chrono::duration<double, std::milli>(now - *lastEventComposite_).count();
+        const int fade = std::clamp(static_cast<int>(std::lround(256.0 * std::exp2(-elapsedMs / 120.0))), 0, 256);
+        lastEventComposite_ = now;
+        for (int y = 0; y < incoming.height(); ++y) {
+            const auto *source = incoming.constScanLine(y);
+            auto *destination = persistentEvents_.scanLine(y);
+            for (int x = 0; x < incoming.width() * 3; x += 3) {
+                if (source[x] || source[x + 1] || source[x + 2]) {
+                    destination[x] = source[x];
+                    destination[x + 1] = source[x + 1];
+                    destination[x + 2] = source[x + 2];
+                }
+                else {
+                    destination[x] = static_cast<uchar>((destination[x] * fade) / 256);
+                    destination[x + 1] = static_cast<uchar>((destination[x + 1] * fade) / 256);
+                    destination[x + 2] = static_cast<uchar>((destination[x + 2] * fade) / 256);
+                }
+            }
+        }
+    }
+
     static QSpinBox *spin(int minimum, int maximum, int value, QWidget *parent) {
         auto *box = new QSpinBox(parent);
         box->setRange(minimum, maximum);
@@ -1661,6 +1708,8 @@ private:
 
     void refreshPreview() {
         lastImage_ = {};
+        persistentEvents_ = {};
+        lastEventComposite_.reset();
         preview_->clear();
         previewTitle_->setText(previewRgb_ ? "Daheng RGB" : "DVXplorer events");
         preview_->setText(previewRgb_ ? "Waiting for Daheng RGB..." : "Waiting for DVXplorer events...");
@@ -1671,6 +1720,8 @@ private:
         record_->setEnabled(recording_ || (ready_ && !busy_));
         previewButton_->setText(previewRgb_ ? "Preview: RGB" : "Preview: Events");
         previewButton_->setEnabled(!recording_ && !busy_ && settings_.recordEvents && settings_.recordRgb);
+        persistenceButton_->setText(eventPersistence_ ? "Event persistence: On" : "Event persistence: Off");
+        persistenceButton_->setEnabled(!previewRgb_ && settings_.recordEvents);
         settingsButton_->setEnabled(!recording_ && !busy_);
     }
 
@@ -1679,6 +1730,7 @@ private:
     std::optional<Settings> pendingSettings_;
     QStackedWidget *pages_ = nullptr;
     QLabel *previewTitle_ = nullptr;
+    QPushButton *persistenceButton_ = nullptr;
     QLabel *preview_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *rgbStatus_ = nullptr;
@@ -1700,6 +1752,9 @@ private:
     QCheckBox *recordRgb_ = nullptr;
     QLineEdit *rgbSerial_ = nullptr;
     QPixmap lastImage_;
+    QImage persistentEvents_;
+    std::optional<std::chrono::steady_clock::time_point> lastEventComposite_;
+    bool eventPersistence_ = true;
     bool previewRgb_ = false;
     bool ready_ = false;
     bool recording_ = false;
