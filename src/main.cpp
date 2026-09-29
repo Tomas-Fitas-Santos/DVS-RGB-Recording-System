@@ -3,6 +3,7 @@
 #include "rgb_recorder.hpp"
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QCheckBox>
 #include <QDateTime>
 #include <QDir>
@@ -36,12 +37,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <ctime>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -49,6 +52,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <sys/stat.h>
@@ -242,7 +246,8 @@ class Recorder final : public QObject {
     Q_OBJECT
 
 public:
-    explicit Recorder(Settings initial) : initial_(std::move(initial)) {}
+    explicit Recorder(Settings initial, bool previewEnabled = true)
+        : initial_(std::move(initial)), previewEnabled_(previewEnabled) {}
 
     void launch() {
         thread_ = std::thread([this] { run(); });
@@ -302,6 +307,7 @@ signals:
 
 private:
     void publishRgbPreview(RgbRecorder::Preview frame) {
+        if (!previewEnabled_) return;
         if (!frame.width || !frame.height || frame.rgb.empty()) return;
         QImage borrowed(frame.rgb.data(), static_cast<int>(frame.width),
             static_cast<int>(frame.height), static_cast<int>(frame.width * 3), QImage::Format_RGB888);
@@ -653,8 +659,11 @@ private:
                     .arg(QString::fromStdString(camera.getCameraName()))
                     .arg(resolution->width).arg(resolution->height), true);
 
-                QImage preview(resolution->width, resolution->height, QImage::Format_RGB888);
-                preview.fill(Qt::black);
+                QImage preview;
+                if (previewEnabled_) {
+                    preview = QImage(resolution->width, resolution->height, QImage::Format_RGB888);
+                    preview.fill(Qt::black);
+                }
                 auto lastPreview = std::chrono::steady_clock::now();
                 auto lastStatistics = lastPreview;
                 auto lastDiskCheck = lastPreview;
@@ -917,7 +926,8 @@ private:
                         rgbPreview.reset();
                         nextRgbPreviewAttempt = loopStart + 3s;
                     }
-                    if (!writer && !rgb && !rgbPreview && loopStart >= nextRgbPreviewAttempt) {
+                    if (previewEnabled_ && !writer && !rgb && !rgbPreview
+                        && loopStart >= nextRgbPreviewAttempt) {
                         try {
                             rgbPreview = std::make_unique<RgbRecorder>(fs::path{},
                                 current.rgbSerial.toStdString(), rgbPreviewCallback, true);
@@ -992,7 +1002,7 @@ private:
                             writer.emplace(output.string(), camera);
                             session = Session{output, current, QString::fromStdString(camera.getCameraName()), utcNow()};
                             rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
-                                rgbPreviewCallback);
+                                previewEnabled_ ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
                             rgb->start();
                             emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
                             session->rgbRawFile = rgb->rawPath();
@@ -1097,8 +1107,9 @@ private:
                                     session->maxCaptureLagMs.value_or(0.0), *latestCaptureLagMs);
                             }
                         }
-                        // Only the display is sampled; the recorded stream is never sampled.
-                        const size_t stride = std::max<size_t>(1, events->size() / 12000);
+                        // Camera-timestamp peak counting remains active without a display.
+                        const size_t stride = previewEnabled_
+                            ? std::max<size_t>(1, events->size() / 12000) : 0;
                         size_t position = 0;
                         for (const auto &event : *events) {
                             if (writer) {
@@ -1117,6 +1128,7 @@ private:
                                 session->peakEventsPerSecond = std::max(
                                     session->peakEventsPerSecond, ++eventSecondCount);
                             }
+                            if (!previewEnabled_) continue;
                             if (position++ % stride != 0) {
                                 continue;
                             }
@@ -1150,7 +1162,8 @@ private:
                     }
 
                     const auto now = std::chrono::steady_clock::now();
-                    if (now - lastPreview >= std::chrono::milliseconds(current.previewIntervalMs)) {
+                    if (previewEnabled_
+                        && now - lastPreview >= std::chrono::milliseconds(current.previewIntervalMs)) {
                         {
                             QMutexLocker lock(&previewMutex_);
                             latestPreview_ = std::move(preview);
@@ -1225,6 +1238,7 @@ private:
 
     std::mutex commandsMutex_;
     const Settings initial_;
+    const bool previewEnabled_;
     std::optional<Settings> apply_;
     std::optional<Settings> start_;
     bool stop_ = false;
@@ -1498,7 +1512,93 @@ private:
 };
 } // namespace dvxrec
 
+namespace {
+volatile std::sig_atomic_t stopRequested = 0;
+
+void requestStop(int) {
+    stopRequested = 1;
+}
+
+void logHeadless(const QString &message) {
+    std::cout << message.toLocal8Bit().constData() << std::endl;
+}
+} // namespace
+
 int main(int argc, char **argv) {
+    bool headless = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--headless") headless = true;
+    }
+    if (headless) {
+        QString output;
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view argument(argv[i]);
+            if (argument == "--headless") continue;
+            if (argument == "--output" && ++i < argc) {
+                output = QString::fromLocal8Bit(argv[i]);
+                continue;
+            }
+            std::cerr << "Usage: dvxplorer_recorder --headless --output /path/to/ssd/recordings\n";
+            return 2;
+        }
+        if (output.trimmed().isEmpty()) {
+            std::cerr << "Specify the recording directory with --output (use the SSD mount).\n";
+            return 2;
+        }
+        const auto outputPath = dvxrec::nativePath(output);
+        if (!outputPath.is_absolute() || !std::filesystem::is_directory(outputPath)) {
+            std::cerr << "--output must be an existing absolute directory on the intended storage device.\n";
+            return 2;
+        }
+        QCoreApplication application(argc, argv);
+        dvxrec::Settings settings = dvxrec::loadSavedSettings();
+        settings.outputDirectory = output;
+        dvxrec::Recorder recorder(settings, false);
+        bool started = false;
+        bool stopping = false;
+        QObject::connect(&recorder, &dvxrec::Recorder::cameraStatus, &application,
+            [&](const QString &message, bool ready) {
+                logHeadless(message);
+                if (ready && !started && !stopping) recorder.start(settings);
+            });
+        QObject::connect(&recorder, &dvxrec::Recorder::recordingState, &application,
+            [&](bool recording, const QString &message) {
+                logHeadless(message);
+                if (recording) {
+                    started = true;
+                    if (stopRequested && !stopping) {
+                        stopping = true;
+                        recorder.stop();
+                    }
+                }
+                else {
+                    application.exit(message.startsWith("Saved ") ? 0 : 1);
+                }
+            });
+        QObject::connect(&recorder, &dvxrec::Recorder::rgbCameraStatus, &application,
+            [](const QString &message) { logHeadless(message); });
+        QObject::connect(&recorder, &dvxrec::Recorder::monitoring, &application,
+            [](const QString &message) { if (!message.isEmpty()) logHeadless(message); });
+        std::signal(SIGINT, requestStop);
+        std::signal(SIGTERM, requestStop);
+        QTimer signalTimer;
+        QObject::connect(&signalTimer, &QTimer::timeout, &application, [&] {
+            if (stopRequested && !stopping) {
+                stopping = true;
+                if (started) {
+                    logHeadless("Stopping and finalizing recording...");
+                    recorder.stop();
+                }
+                else {
+                    application.exit(130);
+                }
+            }
+        });
+        signalTimer.start(100);
+        recorder.launch();
+        logHeadless("Waiting for DVXplorer; Ctrl+C stops and saves after recording starts.");
+        return application.exec();
+    }
     QApplication application(argc, argv);
     const dvxrec::Settings initial = dvxrec::loadSavedSettings();
     dvxrec::Recorder recorder(initial);
