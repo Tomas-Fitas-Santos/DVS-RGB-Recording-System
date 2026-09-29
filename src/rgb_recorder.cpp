@@ -238,7 +238,7 @@ void RgbRecorder::captureLoop() noexcept {
                     }
                 }
                 if (overflow) {
-                    fail("RGB writer queue full: storage cannot keep up with camera");
+                    fail("RGB writer queue full: RGB writer could not keep up with camera intake");
                     break;
                 }
                 ready_.notify_one();
