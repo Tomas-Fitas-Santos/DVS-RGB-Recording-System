@@ -44,6 +44,12 @@ std::string cameraString(GX_DEV_HANDLE device, const char *feature) {
     return value.strCurValue;
 }
 
+std::string deviceText(const unsigned char (&text)[GX_INFO_LENGTH_64_BYTE]) {
+    size_t length = 0;
+    while (length < sizeof(text) && text[length] != 0) ++length;
+    return {reinterpret_cast<const char *>(text), length};
+}
+
 RgbRecorder::Preview thumbnailBayerRG8(const char *bayer, uint32_t width, uint32_t height) {
     RgbRecorder::Preview preview;
     preview.width = std::min<uint32_t>(640, width / 2);
@@ -99,26 +105,44 @@ void RgbRecorder::start() {
         libraryOpen_ = true;
         uint32_t count = 0;
         check(GXUpdateAllDeviceList(&count, 1000), "GXUpdateAllDeviceList");
+        std::string detected;
         for (uint32_t i = 1; i <= count; ++i) {
+            GX_DEVICE_INFO info{};
+            const GX_STATUS infoStatus = GXGetDeviceInfo(i, &info);
+            if (infoStatus != GX_STATUS_SUCCESS) {
+                detected += " #" + std::to_string(i) + " info status " + std::to_string(infoStatus);
+                continue;
+            }
+            if (info.emDevType != GX_DEVICE_CLASS_U3V) {
+                detected += " #" + std::to_string(i) + " non-USB3 device";
+                continue;
+            }
+            const auto model = deviceText(info.DevInfo.stU3VDevInfo.chModelName);
+            const auto serial = deviceText(info.DevInfo.stU3VDevInfo.chSerialNumber);
+            detected += " #" + std::to_string(i) + " " + model + " [" + serial + "]";
+            if (model != "MER2-302-56U3C"
+                || (!requestedSerial_.empty() && serial != requestedSerial_)) continue;
+
             GX_DEV_HANDLE candidate = nullptr;
-            if (GXOpenDeviceByIndex(i, &candidate) != GX_STATUS_SUCCESS) continue;
-            try {
-                const auto model = cameraString(candidate, "DeviceModelName");
-                const auto serial = cameraString(candidate, "DeviceSerialNumber");
-                if (model == "MER2-302-56U3C"
-                    && (requestedSerial_.empty() || serial == requestedSerial_)) {
-                    device_ = candidate;
-                    summary_.serial = serial;
-                    break;
-                }
+            const GX_STATUS openStatus = GXOpenDeviceByIndex(i, &candidate);
+            if (openStatus != GX_STATUS_SUCCESS) {
+                throw std::runtime_error("Daheng " + model + " [" + serial
+                    + "] detected but cannot open (Galaxy status " + std::to_string(openStatus)
+                    + "); close other Galaxy apps and check USB permissions");
             }
-            catch (...) {
-                GXCloseDevice(candidate);
-                throw;
-            }
-            GXCloseDevice(candidate);
+            device_ = candidate;
+            summary_.serial = cameraString(device_, "DeviceSerialNumber");
+            break;
         }
-        if (!device_) throw std::runtime_error("MER2-302-56U3C not found (check Galaxy SDK, USB and serial)");
+        if (!device_) {
+            if (count == 0) {
+                throw std::runtime_error("Galaxy SDK enumerated 0 cameras; check USB connection, "
+                    "udev permissions, and replug the camera after installing the SDK");
+            }
+            throw std::runtime_error("MER2-302-56U3C"
+                + (requestedSerial_.empty() ? std::string{} : " serial " + requestedSerial_)
+                + " not among Galaxy devices:" + detected);
+        }
 
         check(GXSetEnumValueByString(device_, "PixelFormat", "BayerRG8"), "PixelFormat BayerRG8");
         check(GXSetEnumValueByString(device_, "AcquisitionMode", "Continuous"), "AcquisitionMode");
