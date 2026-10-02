@@ -6,10 +6,10 @@ This branch records **DVXplorer events, Daheng MER2-302-56U3C RGB frames, or bot
 
 - Shows one preview at a time on the Pi display. The button between **Start recording** and **Settings** switches between enabled sources while idle and is disabled during recording. The selected preview stays fixed throughout the recording. The event view is polarity-colored, not an intensity image; a still scene may look black. It shows only events from a recent camera-timestamp window (10 ms by default), so movement is not smeared across the full display refresh interval. Above the event view, **Window** cycles through 5, 10, 20, and 50 ms while recording; shorter windows sharpen fast movement but show fewer events. **Noise filter** removes isolated pixels from the displayed image only and can also be toggled during recording; switch it off if small real features disappear. There is no persistence or trail between frames. The RGB view samples BayerRG8 frames at up to 10 Hz and reduces them to at most 640 × 480 for framing/focus checks; saved raw frames retain their original resolution and rate. RGB preview work is skipped if the writer queue is under pressure.
 - Writes every received DVXplorer event with its camera timestamp to an `.aedat4` recording. The preview is sampled separately and is never used as the recording input.
-- Saves received Daheng frames in a matching `.rgb.raw` file as uncompressed BayerRG8. A `.rgb.frames.csv` index records frame ID, camera timestamp ticks, host UTC and monotonic receipt times, byte offset, and size for each frame. A bounded 16-frame queue separates RGB capture from disk writes. Queue overflow or RGB capture/write error interrupts the recording.
+- Saves received Daheng frames in `rgb.raw` as uncompressed BayerRG8. A `rgb.frames.csv` index records frame ID, camera timestamp ticks, host UTC and monotonic receipt times, byte offset, and size for each frame. A bounded 16-frame queue separates RGB capture from disk writes. Queue overflow or RGB capture/write error interrupts the recording.
 - Shows RGB frame counts, missing frame IDs and incomplete frames live. The existing performance/temperature/storage monitoring includes RGB work in app CPU and process writes; the CSV and report track RGB frame rate, raw throughput and gap counts.
 - Enables both external trigger edges and records them in the same AEDAT4 file, if the DVXplorer receives an external signal. This does not generate trigger pulses or synchronize camera clocks on its own.
-- Stores the selected sources, camera information, acquisition parameters, UTC host start/end times, and counts in an adjacent `.json` file. Camera timestamps in AEDAT4 are authoritative for event-to-trigger alignment; the host times are operational metadata.
+- Creates one folder per recording, named with its UTC creation time and selected sources. It keeps all selected data files, `session.json`, `report.md`, and an optional `monitor.csv` together. The JSON stores the camera information, acquisition parameters, UTC host start/end times, and counts. Camera timestamps in AEDAT4 are authoritative for event-to-trigger alignment; the host times are operational metadata.
 - Provides a settings screen on the Pi display. Settings and recording directory can be changed only between recordings. The DVXplorer worker owns AEDAT4 capture and preview; separate RGB capture and writer threads share a bounded queue. The Qt GUI runs on its normal thread. No thread is pinned to a core.
 - Remembers successfully applied settings across app restarts on the Pi.
 - Offers `--headless` recording from an SSH terminal: no Qt display, DVXplorer event preview, RGB color conversion, or screen sharing. Capture, monitoring, and saved reports use the same recorder as the GUI.
@@ -58,13 +58,28 @@ Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder aga
 2. Open **Settings** while idle. Select **Record DVXplorer events**, **Record Daheng RGB frames**, or both; at least one must be on. Choose the SSD output directory, adjust contrast and preview interval, and select monitoring. If several Daheng cameras are attached, enter the intended RGB serial. Tap **Apply settings** and wait for the acknowledgement.
 3. Use the middle **Preview** button to choose which enabled source to display. The button is disabled when only one source is selected or recording is active. For the event view, adjust **Window** and **Noise filter** above the preview, even during recording. Try 5 or 10 ms for fast motion and 20 ms if too few events are visible; turn off the noise filter if it removes faint subject pixels. Click **Start recording**. The app opens only the selected recording sources; counters update for those sources.
 4. Click **Stop recording** and wait for **Saved ...** before disconnecting power. The selected files close and the app saves a report.
-5. When events were selected, inspect the AEDAT4 with `dv-filestat -v /path/to/file.aedat4` or `dv::io::MonoCameraRecording` / DV GUI. When testing external trigger wiring, verify the file contains trigger events.
+5. When events were selected, inspect the AEDAT4 with `dv-filestat -v /path/to/session/events.aedat4` or `dv::io::MonoCameraRecording` / DV GUI. When testing external trigger wiring, verify the file contains trigger events.
 
-| Sources selected | Data files created (plus `.json`, `.report.md`, and optional `.monitor.csv`) |
-| --- | --- |
-| Events only | `DVXplorer_<time>.aedat4` |
-| RGB only | `Daheng_<time>.rgb.raw` and `Daheng_<time>.rgb.frames.csv` |
-| Both | `DVXplorer_<time>.aedat4`, `.aedat4.rgb.raw`, and `.aedat4.rgb.frames.csv` |
+Each new recording has its own folder inside the chosen output directory. For example, `2026-10-02_15-34-12-123Z_Events-RGB/` contains:
+
+```text
+events.aedat4
+rgb.raw
+rgb.frames.csv
+session.json
+report.md
+monitor.csv
+```
+
+The final file is present only when at least one monitoring option is on. The timestamp in the folder name is UTC; a numeric suffix prevents collisions if two recordings start within the same millisecond.
+
+| Sources selected | Folder suffix | Data files inside |
+| --- | --- | --- |
+| Events only | `_Events` | `events.aedat4` |
+| RGB only | `_RGB` | `rgb.raw`, `rgb.frames.csv` |
+| Both | `_Events-RGB` | `events.aedat4`, `rgb.raw`, `rgb.frames.csv` |
+
+Every folder also contains `session.json` and `report.md`, and contains `monitor.csv` when monitoring was enabled. Older recordings retain their original flat filenames; the app does not move them.
 
 The app stops a recording when free space drops below 1 GiB, and refuses to start when less than 2 GiB is available; it checks every 500 ms while recording. An interrupted session is marked in its metadata if the process is still running. Sudden power loss can leave the current data files incomplete, so stop and wait for completion before powering down.
 
@@ -95,7 +110,7 @@ cd ~/Desktop/DVS-RGB-Recording-System
 
 It waits for the selected camera sources, then starts recording and prints status and any enabled monitoring in the terminal. It does not open a window or construct either live preview. Press **Ctrl+C once** to stop; wait until `Saved ...` appears before shutting down or unplugging the SSD. A start error or interrupted recording exits with a nonzero status.
 
-For a recording that must survive an SSH disconnect, launch the command inside `tmux new -s birds-record`; detach with **Ctrl+B, D** and later run `tmux attach -t birds-record` to return and stop with Ctrl+C. You can inspect `.monitor.csv` and `.report.md` over SSH while the data files stay on the Pi. Screen sharing is unnecessary and has its own CPU and network overhead. Headless mode still uses the required camera and writer threads; it does not dedicate or pin a CPU core.
+For a recording that must survive an SSH disconnect, launch the command inside `tmux new -s birds-record`; detach with **Ctrl+B, D** and later run `tmux attach -t birds-record` to return and stop with Ctrl+C. You can inspect `monitor.csv` and `report.md` in the session folder over SSH while the data files stay on the Pi. Screen sharing is unnecessary and has its own CPU and network overhead. Headless mode still uses the required camera and writer threads; it does not dedicate or pin a CPU core.
 
 ### Start the Pi-screen preview and recording from the PC
 
@@ -130,15 +145,15 @@ With the app stopped, run `lsusb` and `lsusb -t` on the Pi. Confirm that the Dah
 
 The Settings page has three independent checkboxes, changeable only between recordings:
 
-| Option | Live display and `.monitor.csv` fields |
+| Option | Live display and `monitor.csv` fields |
 | --- | --- |
 | Performance | Received event and trigger rates, the highest 10 ms camera-timestamp event rate in each monitoring interval, application CPU use normalized to all online cores (100% means the entire Pi CPU capacity), recorder worker CPU use normalized to one core, whole-system CPU usage, application RAM, CPU frequency, and the longest interval between capture-loop starts. Event counts on screen use commas every three digits. |
 | Temperature | Pi SoC temperature from `/sys/class/thermal/thermal_zone0/temp`. A blank CSV value or “unavailable” means that path could not be read. Treat it as a trend indicator; Raspberry Pi recommends `vcgencmd measure_temp` for an accurate instantaneous reading. |
 | Storage | AEDAT4 file growth, process write rate from `/proc/self/io`, block-device write rate, busy time, mean completed-write latency, and sampled I/O requests in flight from Linux sysfs, longest and total writer-call time, relative capture lag, writer finalization time, free filesystem space, system-wide dirty and writeback memory, and system-wide I/O pressure `some avg10`. The recording JSON identifies the filesystem’s block device when Linux exposes it, such as `mmcblk0p2` or `nvme0n1p1`. |
 
-Enabled options are sampled approximately once per second by the existing recording worker. Monitoring does not create another thread or pin work to a core. RGB acquisition and file writing have dedicated threads because frame transfers and SSD writes must not stall the recording loop. The OS schedules these threads on available cores. If any monitoring option is enabled, the app saves a `.monitor.csv` next to the recording, and its `.json` records the selected sources and options, storage device, final file size when applicable, and any monitoring-file error. A CSV error does not stop recording.
+Enabled options are sampled approximately once per second by the existing recording worker. Monitoring does not create another thread or pin work to a core. RGB acquisition and file writing have dedicated threads because frame transfers and SSD writes must not stall the recording loop. The OS schedules these threads on available cores. If any monitoring option is enabled, the app saves `monitor.csv` in the session folder, and `session.json` records the selected sources and options, storage device, final file size when applicable, and any monitoring-file error. A CSV error does not stop recording.
 
-After **every recording**, the app also saves a human-readable `.report.md` beside the data and JSON files. It identifies the selected sources and session outcome, and includes available event totals, peak intake and file size, RGB frame diagnostics, and (when monitoring was enabled) a minimum/mean/maximum table for every metric column in the CSV. The **peak event-intake interval** section selects the one-second monitoring sample with the highest recorded event rate when events are enabled. The CSV remains the complete time series with individual sample times. Report generation happens after capture stops on the existing worker; a report error is shown in the app and recorded in JSON. Abrupt power loss or process termination cannot produce a final report.
+After **every recording**, the app also saves a human-readable `report.md` in that folder. It identifies the selected sources and session outcome, and includes available event totals, peak intake and file size, RGB frame diagnostics, and (when monitoring was enabled) a minimum/mean/maximum table for every metric column in the CSV. The **peak event-intake interval** section selects the one-second monitoring sample with the highest recorded event rate when events are enabled. The CSV remains the complete time series with individual sample times. Report generation happens after capture stops on the existing worker; a report error is shown in the app and recorded in JSON. Abrupt power loss or process termination cannot produce a final report.
 
 The **Saved** message and JSON include the peak number of recorded events in any one-second camera-timestamp bin. The JSON and report also include the maximum count in a 10 ms camera-timestamp bin. Both counts are measured while recording even if monitoring is off. The live event-rate display instead divides events received since the last monitoring sample by its actual elapsed time. The report identifies the DVXplorer's negotiated USB speed and sysfs port when the camera serial matches the connected USB device; this is a link rating (normally 480 or 5000 Mb/s), not a measured transfer rate.
 
