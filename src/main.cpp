@@ -401,6 +401,7 @@ private:
     }
 
     struct Session {
+        fs::path directory;
         fs::path file;
         Settings settings;
         QString cameraName;
@@ -443,6 +444,7 @@ private:
             {"temperature_monitoring", session.settings.temperatureMonitoring},
             {"storage_monitoring", session.settings.storageMonitoring},
             {"storage_device", QString::fromStdString(session.storageDeviceName)},
+            {"session_folder", QString::fromStdString(session.directory.filename().string())},
             {"aedat_file", session.settings.recordEvents
                 ? QString::fromStdString(session.file.filename().string()) : QString{}},
             {"aedat_bytes", session.settings.recordEvents
@@ -486,7 +488,7 @@ private:
             {"report_error", session.reportError},
             {"error", error}
         };
-        const QString sidecar = QString::fromStdString(session.file.string()) + ".json";
+        const QString sidecar = QString::fromStdString((session.directory / "session.json").string());
         QSaveFile file(sidecar);
         if (!file.open(QIODevice::WriteOnly)) {
             throw std::runtime_error("Cannot open recording metadata file");
@@ -606,7 +608,8 @@ private:
 
         QStringList report{
             "# Camera recording report", "",
-            QString("- Recording: `%1`").arg(QString::fromStdString(session.file.filename().string())),
+            QString("- Recording folder: `%1`").arg(QString::fromStdString(session.directory.filename().string())),
+            QString("- Event file: %1").arg(session.settings.recordEvents ? "`events.aedat4`" : "not recorded"),
             QString("- Sources: %1").arg(session.settings.recordEvents && session.settings.recordRgb
                 ? "DVXplorer events + Daheng RGB" : session.settings.recordEvents
                     ? "DVXplorer events" : "Daheng RGB"),
@@ -1109,7 +1112,7 @@ private:
                     catch (const std::exception &e) {
                         emit cameraStatus(QString("Metadata error: %1").arg(e.what()), true);
                     }
-                    const QString path = QString::fromStdString(session->file.string());
+                    const QString path = QString::fromStdString(session->directory.string());
                     emit recordingState(false, outcome == "complete"
                         ? QString("Saved %1%2%3 | Report: %4")
                             .arg(path,
@@ -1259,6 +1262,7 @@ private:
                         }
                     }
                     if (commands.start && !session) {
+                        fs::path sessionDirectory;
                         try {
                             if (!commands.start->recordEvents && !commands.start->recordRgb)
                                 throw std::runtime_error("Enable RGB, events, or both");
@@ -1273,29 +1277,24 @@ private:
                                 throw std::runtime_error("Less than 2 GiB free in output directory");
                             }
                             lastDiskFreeMiB = availableBytes / (1024.0 * 1024.0);
-                            fs::path output;
-                            const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyyMMddTHHmmsszzzZ");
+                            const QString stamp = QDateTime::currentDateTimeUtc().toString("yyyy-MM-dd_HH-mm-ss-zzz") + "Z";
+                            const QString sources = current.recordEvents
+                                ? (current.recordRgb ? "Events-RGB" : "Events") : "RGB";
                             for (unsigned index = 0;; ++index) {
-                                const QString name = (current.recordEvents ? "DVXplorer_" : "Daheng_") + stamp
-                                    + (index ? "_" + QString::number(index) : QString{})
-                                    + (current.recordEvents ? ".aedat4" : "");
-                                output = directory / nativePath(name);
-                                if (!fs::exists(output) && !fs::exists(output.string() + ".rgb.raw")
-                                    && !fs::exists(output.string() + ".rgb.frames.csv")
-                                    && !fs::exists(output.string() + ".json")
-                                    && !fs::exists(output.string() + ".monitor.csv")
-                                    && !fs::exists(output.string() + ".report.md")) {
-                                    break;
-                                }
+                                const QString name = stamp + "_" + sources
+                                    + (index ? "_" + QString::number(index) : QString{});
+                                sessionDirectory = directory / nativePath(name);
+                                if (fs::create_directory(sessionDirectory)) break;
                             }
+                            const fs::path output = sessionDirectory / "events.aedat4";
                             if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
                             if (current.recordEvents) writer.emplace(output.string(), *camera);
-                            session = Session{output, current,
+                            session = Session{sessionDirectory, output, current,
                                 current.recordEvents ? QString::fromStdString(camera->getCameraName()) : QString{}, utcNow()};
                             if (current.recordEvents) session->dvUsbLink = dvxplorerUsbLink(camera->getCameraName());
                             if (current.recordRgb) {
-                                rgb = std::make_unique<RgbRecorder>(output, current.rgbSerial.toStdString(),
+                                rgb = std::make_unique<RgbRecorder>(sessionDirectory, current.rgbSerial.toStdString(),
                                     previewEnabled_ && previewRgb ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
                                 rgb->start();
                                 emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
@@ -1305,11 +1304,11 @@ private:
                             }
                             else emit rgbCameraStatus("RGB recording disabled");
                             session->startUtc = utcNow();
-                            session->reportFile = fs::path(output.string() + ".report.md");
+                            session->reportFile = sessionDirectory / "report.md";
                             session->storageDeviceName = storageDevice(directory);
                             if (current.performanceMonitoring || current.temperatureMonitoring
                                 || current.storageMonitoring) {
-                                session->monitorFile = fs::path(output.string() + ".monitor.csv");
+                                session->monitorFile = sessionDirectory / "monitor.csv";
                                 if (current.storageMonitoring) {
                                     const auto device = blockDeviceSysfsPath(directory);
                                     blockStatsFile = device.empty() ? fs::path{} : device / "stat";
@@ -1369,7 +1368,8 @@ private:
                             saveMetadata(*session, "recording");
                             emit statistics(0, 0);
                             emit rgbStatistics(0, 0, 0);
-                            emit recordingState(true, QString("Recording %1").arg(QString::fromStdString(output.filename().string())));
+                            emit recordingState(true, QString("Recording %1")
+                                .arg(QString::fromStdString(sessionDirectory.filename().string())));
                         }
                         catch (const std::exception &e) {
                             if (rgb) {
@@ -1379,6 +1379,8 @@ private:
                             monitorLog.reset();
                             writer.reset();
                             session.reset();
+                            std::error_code removeError;
+                            if (!sessionDirectory.empty()) fs::remove(sessionDirectory, removeError);
                             emit recordingState(false, QString("Cannot start: %1").arg(e.what()));
                         }
                     }
@@ -1540,7 +1542,7 @@ private:
                         lastStatistics = now;
                     }
                     if (session && now - lastDiskCheck >= 500ms) {
-                        const auto availableBytes = fs::space(session->file.parent_path()).available;
+                        const auto availableBytes = fs::space(session->directory).available;
                         lastDiskFreeMiB = availableBytes / (1024.0 * 1024.0);
                         if (availableBytes < 1ULL * 1024 * 1024 * 1024) {
                             throw std::runtime_error("Low disk space (under 1 GiB)");
