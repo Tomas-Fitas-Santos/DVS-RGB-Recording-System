@@ -43,7 +43,7 @@ public:
         std::string error;
     };
 
-    explicit RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial = {},
+    explicit RgbRecorder(std::filesystem::path sessionDirectory, std::string requestedSerial = {},
         PreviewCallback previewCallback = {}, bool previewOnly = false);
     ~RgbRecorder();
     RgbRecorder(const RgbRecorder &) = delete;
