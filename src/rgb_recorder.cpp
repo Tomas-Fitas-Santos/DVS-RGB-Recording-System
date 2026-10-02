@@ -73,10 +73,10 @@ RgbRecorder::Preview thumbnailBayerRG8(const char *bayer, uint32_t width, uint32
 }
 } // namespace
 
-RgbRecorder::RgbRecorder(std::filesystem::path aedatPath, std::string requestedSerial,
+RgbRecorder::RgbRecorder(std::filesystem::path sessionDirectory, std::string requestedSerial,
     PreviewCallback previewCallback, bool previewOnly)
-    : rawPath_(aedatPath.string() + ".rgb.raw"),
-      indexPath_(aedatPath.string() + ".rgb.frames.csv"),
+    : rawPath_(sessionDirectory / "rgb.raw"),
+      indexPath_(sessionDirectory / "rgb.frames.csv"),
       requestedSerial_(std::move(requestedSerial)),
       previewCallback_(std::move(previewCallback)), previewOnly_(previewOnly) {}
 
