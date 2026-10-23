@@ -1190,11 +1190,11 @@ private:
                                 writer->writeTrigger(trigger);
                                 ++session->triggers;
                                 if (!exposureLog) continue;
-                                const auto type = trigger.type();
+                                const auto type = trigger.type;
                                 if (type != dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE
                                     && type != dv::TriggerType::EXTERNAL_SIGNAL_RISING_EDGE) continue;
                                 auto window = session->exposureSync.observe(
-                                    type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE, trigger.timestamp());
+                                    type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE, trigger.timestamp);
                                 if (window) {
                                     *exposureLog << session->exposureSync.completeWindows << ',' << window->first
                                         << ',' << window->second << ',' << window->second - window->first << '\n';
@@ -1413,10 +1413,15 @@ private:
                             const fs::path output = sessionDirectory / "events.aedat4";
                             if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
-                            if (current.recordEvents) camera->getNextTriggerBatch(); // Discard idle preview edges.
+                            if (current.recordEvents) (void)camera->getNextTriggerBatch(); // Discard idle preview edges.
                             if (current.recordEvents) writer.emplace(output.string(), *camera);
-                            session = Session{sessionDirectory, output, current,
-                                current.recordEvents ? QString::fromStdString(camera->getCameraName()) : QString{}, utcNow()};
+                            session.emplace();
+                            session->directory = sessionDirectory;
+                            session->file = output;
+                            session->settings = current;
+                            session->cameraName = current.recordEvents
+                                ? QString::fromStdString(camera->getCameraName()) : QString{};
+                            session->startUtc = utcNow();
                             if (current.recordEvents) session->dvUsbLink = dvxplorerUsbLink(camera->getCameraName());
                             if (current.recordRgb) {
                                 rgb = std::make_unique<RgbRecorder>(sessionDirectory, current.rgbSerial.toStdString(),
@@ -1624,12 +1629,12 @@ private:
                             for (const auto &trigger : *triggers) {
                                 writer->writeTrigger(trigger);
                                 if (exposureLog) {
-                                    const auto type = trigger.type();
+                                    const auto type = trigger.type;
                                     if (type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE
                                         || type == dv::TriggerType::EXTERNAL_SIGNAL_RISING_EDGE) {
                                         auto window = session->exposureSync.observe(
                                             type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE,
-                                            trigger.timestamp());
+                                            trigger.timestamp);
                                         if (window) {
                                             *exposureLog << session->exposureSync.completeWindows << ',' << window->first
                                                 << ',' << window->second << ',' << window->second - window->first << '\n';
