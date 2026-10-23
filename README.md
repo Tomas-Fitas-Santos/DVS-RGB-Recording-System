@@ -1,6 +1,6 @@
 # DVS-RGB Recording System
 
-This branch records **DVXplorer events, Daheng MER2-302-56U3C RGB frames, or both** on one Raspberry Pi 5. Only cameras selected for recording are required to start. When both are selected, their acquisition is concurrent; their device clocks are not electrically synchronized by this software.
+This branch records **DVXplorer events, Daheng MER2-302-56U3C RGB frames, or both** on one Raspberry Pi 5. Only cameras selected for recording are required to start. For paired recordings, the Daheng can output its exposure signal on Line1 into the DVXplorer's external trigger input. The recorder then writes the edges in the DVXplorer timestamp domain; it does not synchronize the two cameras' internal clocks.
 
 ## What it does
 
@@ -8,14 +8,14 @@ This branch records **DVXplorer events, Daheng MER2-302-56U3C RGB frames, or bot
 - Writes every received DVXplorer event with its camera timestamp to an `.aedat4` recording. The preview is sampled separately and is never used as the recording input.
 - Saves received Daheng frames in `rgb.raw` as uncompressed BayerRG8. A `rgb.frames.csv` index records frame ID, camera timestamp ticks, host UTC and monotonic receipt times, byte offset, and size for each frame. A bounded 16-frame queue separates RGB capture from disk writes. Queue overflow or RGB capture/write error interrupts the recording.
 - Shows RGB frame counts, missing frame IDs and incomplete frames live. The existing performance/temperature/storage monitoring includes RGB work in app CPU and process writes; the CSV and report track RGB frame rate, raw throughput and gap counts.
-- Enables both external trigger edges and records them in the same AEDAT4 file, if the DVXplorer receives an external signal. This does not generate trigger pulses or synchronize camera clocks on its own.
+- Sets Daheng Line1 to `ExposureActive` with the line inverter off, enables both DVXplorer external trigger edges, and records received triggers in AEDAT4. During paired capture, `rgb.exposures.csv` pairs falling and rising edges as exposure windows in the DVXplorer timestamp domain. The report counts incomplete and anomalous edge sequences. These markers require the external circuit and an on-device test.
 - Creates one folder per recording, named with its UTC creation time and selected sources. It keeps all selected data files, `session.json`, `report.md`, and an optional `monitor.csv` together. The JSON stores the camera information, acquisition parameters, UTC host start/end times, and counts. Camera timestamps in AEDAT4 are authoritative for event-to-trigger alignment; the host times are operational metadata.
 - Provides a settings screen on the Pi display. Settings and recording directory can be changed only between recordings. The DVXplorer worker owns AEDAT4 capture and preview; separate RGB capture and writer threads share a bounded queue. The Qt GUI runs on its normal thread. No thread is pinned to a core.
 - Remembers successfully applied settings across app restarts on the Pi.
 - Offers `--headless` recording from an SSH terminal: no Qt display, DVXplorer event preview, RGB color conversion, or screen sharing. Capture, monitoring, and saved reports use the same recorder as the GUI.
 - Optional 1 Hz performance, temperature, and storage diagnostics during capture, shown on the live screen and saved beside each recording.
 
-ON/OFF contrast defaults to 9. The recorder applies no software event filtering and saves every event delivered by the DVXplorer.
+ON/OFF contrast defaults to 9. The recorder applies no software event filtering and saves every event delivered by the DVXplorer. Between recordings, Settings also provides fixed RGB exposure time in Standard (20–1,000,000 µs) or UltraShort (1–100 µs) mode and an optional RGB frame-rate limit (1–56 fps); zero disables the camera's frame-rate limit. Uncheck fixed exposure to leave the camera's existing exposure settings unchanged. The existing Performance checkbox turns CPU, memory, event-rate and loop-delay sampling on or off independently of Temperature and Storage monitoring.
 
 ## Build on the Raspberry Pi
 
@@ -55,10 +55,10 @@ Reboot and confirm `getconf PAGE_SIZE` reports `4096`, then run the recorder aga
 ## Field use
 
 1. Connect the cameras you intend to record over USB 3 and the SSD to a blue Pi USB 3 port. The Pi 5 has two blue ports, so three USB 3 peripherals require a suitable **powered USB 3 hub** on the other port or another storage interface. They share USB bandwidth; test the chosen physical topology under real load.
-2. Open **Settings** while idle. Select **Record DVXplorer events**, **Record Daheng RGB frames**, or both; at least one must be on. Choose the SSD output directory, adjust contrast and preview interval, and select monitoring. If several Daheng cameras are attached, enter the intended RGB serial. Tap **Apply settings** and wait for the acknowledgement.
+2. Open **Settings** while idle. Select **Record DVXplorer events**, **Record Daheng RGB frames**, or both; at least one must be on. Choose the SSD output directory, adjust ON/OFF contrast, RGB exposure and frame-rate limit, preview interval, and performance/temperature/storage monitoring. If several Daheng cameras are attached, enter the intended RGB serial. Tap **Apply settings** and wait for the acknowledgement. Start the first sync check with Standard fixed exposure around 1,000 µs; test UltraShort only after both exposure edges are reliably detected.
 3. Use the middle **Preview** button to choose which enabled source to display. The button is disabled when only one source is selected or recording is active. For the event view, adjust **Window** and **Noise filter** above the preview, even during recording. Try 5 or 10 ms for fast motion and 20 ms if too few events are visible; turn off the noise filter if it removes faint subject pixels. Click **Start recording**. The app opens only the selected recording sources; counters update for those sources.
 4. Click **Stop recording** and wait for **Saved ...** before disconnecting power. The selected files close and the app saves a report.
-5. When events were selected, inspect the AEDAT4 with `dv-filestat -v /path/to/session/events.aedat4` or `dv::io::MonoCameraRecording` / DV GUI. When testing external trigger wiring, verify the file contains trigger events.
+5. When events were selected, inspect the AEDAT4 with `dv-filestat -v /path/to/session/events.aedat4` or `dv::io::MonoCameraRecording` / DV GUI. For paired sync, check `report.md` for plausible exposure edges and no repeated/missing edges. Compare `rgb.exposures.csv` with `rgb.frames.csv`; the former uses DVX timestamps and the latter uses Daheng camera ticks plus host receipt times. A complete window count near the saved frame count is a first check, not proof that each window matches its corresponding frame.
 
 Each new recording has its own folder inside the chosen output directory. For example, `2026-10-02_15-34-12-123Z_Events-RGB/` contains:
 
@@ -66,18 +66,19 @@ Each new recording has its own folder inside the chosen output directory. For ex
 events.aedat4
 rgb.raw
 rgb.frames.csv
+rgb.exposures.csv
 session.json
 report.md
 monitor.csv
 ```
 
-The final file is present only when at least one monitoring option is on. The timestamp in the folder name is UTC; a numeric suffix prevents collisions if two recordings start within the same millisecond.
+`rgb.exposures.csv` is present only when both sources are recorded; `monitor.csv` is present only when at least one monitoring option is on. The timestamp in the folder name is UTC; a numeric suffix prevents collisions if two recordings start within the same millisecond.
 
 | Sources selected | Folder suffix | Data files inside |
 | --- | --- | --- |
 | Events only | `_Events` | `events.aedat4` |
 | RGB only | `_RGB` | `rgb.raw`, `rgb.frames.csv` |
-| Both | `_Events-RGB` | `events.aedat4`, `rgb.raw`, `rgb.frames.csv` |
+| Both | `_Events-RGB` | `events.aedat4`, `rgb.raw`, `rgb.frames.csv`, `rgb.exposures.csv` |
 
 Every folder also contains `session.json` and `report.md`, and contains `monitor.csv` when monitoring was enabled. Older recordings retain their original flat filenames; the app does not move them.
 
@@ -139,7 +140,13 @@ The app reports whether Galaxy enumerated zero devices, found a different model 
 
 With the app stopped, run `lsusb` and `lsusb -t` on the Pi. Confirm that the Daheng camera is physically listed and attached over USB 3 (`5000M`) through a blue port or a suitable powered USB 3 hub. The Galaxy SDK installer says to unplug and reconnect USB3 cameras after installation; do that if the app reports zero devices. If USB lists the camera but Galaxy still finds none, inspect the SDK's udev permissions for the `birds` user. If the app detects the exact model and serial but cannot open it, close GalaxyView or any other application that has the camera open and check the reported Galaxy status. A nonmatching serial entered in Settings also prevents selection. Keep the full status text when reporting the problem; "not found" alone cannot distinguish these cases.
 
-**Synchronization:** Daheng camera timestamps are native ticks and DVXplorer event/trigger timestamps are native microseconds; their epochs and units are not interchangeable. Host UTC times provide approximate ordering, not precise exposure-to-event alignment. For precise alignment, wire a camera exposure/trigger signal to the DVXplorer external trigger input, verify electrical compatibility, and validate edges against RGB frame IDs in a real test. The app records DVXplorer trigger events but does not generate pulses or assume a fixed clock offset.
+### Paired-camera exposure-marker test
+
+Use the already planned isolated Line1 circuit. With power removed, wire Daheng **Line1+ (pin 8)** to the DVXplorer **SIGNAL_IN** and to your regulated **5 V through 1 kΩ**. Wire Daheng **Line1− (pin 7)** to the external 0 V and DVXplorer **GND_IN**; supply that same 5 V to DVXplorer **VDD_IN**, and connect **CLOCK_IN** to **VDD_IN** if no clock signal is used. Confirm connector orientation and voltages against both camera manuals before powering on. Connect to the DVXplorer **INPUT SYNC** connector, never the output connector. Line1 is optically isolated; the 5 V resistor drives it at approximately 4 mA when active.
+
+With the two cameras connected, select **both** sources and record a short static scene with Standard 1,000 µs exposure. The software programs `ExposureActive` on Daheng Line1: a falling edge marks exposure start and a rising edge marks exposure end with this circuit. Examine `report.md`, `rgb.exposures.csv`, `rgb.frames.csv`, and the AEDAT4 trigger stream. Zero complete windows means the synchronization has **not** been demonstrated; check the circuit, camera line configuration and input detector. Check the frame IDs and edge anomalies across a longer movement recording before using window order to associate exposures with images. Frame boundaries at start/stop can account for a small count difference. The CSV uses `window_index,start_dvx_us,end_dvx_us,duration_us`; these are **DVXplorer** timestamps, directly comparable with event timestamps. The RGB frame CSV's native camera ticks have another clock and cannot be directly subtracted from them.
+
+UltraShort exposures need a separate hardware check. The Daheng Line1 opto-isolated output has rise/fall delays up to tens of microseconds, and DVXplorer's stated temporal resolution is 200 µs. Very short pulses may be missed, and two valid edges can carry the same DVX timestamp, giving a reported `duration_us` of zero. A zero-width timestamp window is not a zero physical exposure. Verify the electrical waveform at the DVX input with suitable test equipment before relying on UltraShort start/end markers.
 
 ## Recording diagnostics
 

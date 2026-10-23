@@ -1,6 +1,7 @@
 #include <dv-processing/io/camera/dvxplorer.hpp>
 #include <dv-processing/io/mono_camera_writer.hpp>
 #include "rgb_recorder.hpp"
+#include "exposure_sync.hpp"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -76,7 +77,16 @@ struct Settings {
     QString rgbSerial;
     bool recordEvents = true;
     bool recordRgb = true;
+    bool rgbManualExposure = false;
+    bool rgbUltraShortExposure = false;
+    int rgbExposureUs = 1000;
+    int rgbFrameRateLimitFps = 0;
 };
+
+RgbCaptureOptions rgbOptions(const Settings &settings) {
+    return {settings.rgbManualExposure, settings.rgbUltraShortExposure,
+        settings.rgbExposureUs, settings.rgbFrameRateLimitFps};
+}
 
 Settings loadSavedSettings() {
     QSettings saved("BirdHKE", "DVXplorerRecorder");
@@ -94,6 +104,10 @@ Settings loadSavedSettings() {
     settings.rgbSerial = saved.value("rgbSerial", "").toString().trimmed();
     settings.recordEvents = saved.value("recordEvents", true).toBool();
     settings.recordRgb = saved.value("recordRgb", true).toBool();
+    settings.rgbManualExposure = saved.value("rgbManualExposure", false).toBool();
+    settings.rgbUltraShortExposure = saved.value("rgbUltraShortExposure", false).toBool();
+    settings.rgbExposureUs = std::clamp(saved.value("rgbExposureUs", 1000).toInt(), 1, 1'000'000);
+    settings.rgbFrameRateLimitFps = std::clamp(saved.value("rgbFrameRateLimitFps", 0).toInt(), 0, 56);
     if (!settings.recordEvents && !settings.recordRgb) settings.recordEvents = true;
     return settings;
 }
@@ -110,6 +124,10 @@ void saveSettings(const Settings &settings) {
     saved.setValue("rgbSerial", settings.rgbSerial);
     saved.setValue("recordEvents", settings.recordEvents);
     saved.setValue("recordRgb", settings.recordRgb);
+    saved.setValue("rgbManualExposure", settings.rgbManualExposure);
+    saved.setValue("rgbUltraShortExposure", settings.rgbUltraShortExposure);
+    saved.setValue("rgbExposureUs", settings.rgbExposureUs);
+    saved.setValue("rgbFrameRateLimitFps", settings.rgbFrameRateLimitFps);
 }
 
 fs::path nativePath(const QString &path) {
@@ -423,6 +441,8 @@ private:
         RgbRecorder::Summary rgb;
         fs::path rgbRawFile;
         fs::path rgbIndexFile;
+        fs::path rgbExposureFile;
+        ExposureSync exposureSync;
     };
 
     static void saveMetadata(const Session &session, const QString &state, const QString &error = {}) {
@@ -439,6 +459,15 @@ private:
             {"trigger_count", static_cast<qint64>(session.triggers)},
             {"contrast_on", session.settings.contrastOn},
             {"contrast_off", session.settings.contrastOff},
+            {"rgb_manual_exposure", session.settings.rgbManualExposure},
+            {"rgb_ultra_short_exposure", session.settings.rgbUltraShortExposure},
+            {"rgb_exposure_us_requested", session.settings.rgbManualExposure
+                ? QJsonValue(session.settings.rgbExposureUs) : QJsonValue()},
+            {"rgb_exposure_us_camera_reported", session.settings.recordRgb
+                ? QJsonValue(session.rgb.appliedExposureUs) : QJsonValue()},
+            {"rgb_frame_rate_fps_camera_reported", session.settings.recordRgb
+                ? QJsonValue(session.rgb.appliedFrameRateFps) : QJsonValue()},
+            {"rgb_frame_rate_limit_fps", session.settings.rgbFrameRateLimitFps},
             {"preview_interval_ms", session.settings.previewIntervalMs},
             {"performance_monitoring", session.settings.performanceMonitoring},
             {"temperature_monitoring", session.settings.temperatureMonitoring},
@@ -478,6 +507,15 @@ private:
             {"rgb_error", QString::fromStdString(session.rgb.error)},
             {"rgb_raw_file", QString::fromStdString(session.rgbRawFile.filename().string())},
             {"rgb_frame_index", QString::fromStdString(session.rgbIndexFile.filename().string())},
+            {"rgb_exposure_windows_file", QString::fromStdString(session.rgbExposureFile.filename().string())},
+            {"exposure_start_edges", static_cast<qint64>(session.exposureSync.starts)},
+            {"exposure_end_edges", static_cast<qint64>(session.exposureSync.ends)},
+            {"complete_exposure_windows", static_cast<qint64>(session.exposureSync.completeWindows)},
+            {"unmatched_exposure_end_edges", static_cast<qint64>(session.exposureSync.unmatchedEnds)},
+            {"repeated_exposure_start_edges", static_cast<qint64>(session.exposureSync.repeatedStarts)},
+            {"invalid_exposure_durations", static_cast<qint64>(session.exposureSync.invalidDurations)},
+            {"zero_duration_exposure_windows", static_cast<qint64>(session.exposureSync.zeroDurationWindows)},
+            {"open_exposure_window_at_stop", session.exposureSync.pendingStartUs.has_value()},
             {"max_relative_capture_lag_ms", session.maxCaptureLagMs
                 ? QJsonValue(*session.maxCaptureLagMs) : QJsonValue()},
             {"monitor_csv", session.monitorFile.empty()
@@ -628,6 +666,18 @@ private:
                 : "not recorded"),
             QString("- RGB frames: %1").arg(session.settings.recordRgb
                 ? groupedCount(session.rgb.frames) : "not recorded"),
+            QString("- RGB exposure mode / requested time: %1 / %2").arg(
+                !session.settings.recordRgb ? "not recorded" : !session.settings.rgbManualExposure
+                    ? "camera default" : session.settings.rgbUltraShortExposure ? "UltraShort" : "Standard",
+                !session.settings.recordRgb || !session.settings.rgbManualExposure ? "camera default"
+                    : QString::number(session.settings.rgbExposureUs) + " us"),
+            QString("- RGB exposure time reported by camera: %1 us")
+                .arg(session.settings.recordRgb && session.rgb.appliedExposureUs > 0
+                    ? QString::number(session.rgb.appliedExposureUs, 'f', 2) : "unavailable"),
+            QString("- RGB frame-rate limit: %1").arg(session.settings.recordRgb
+                ? (session.settings.rgbFrameRateLimitFps
+                    ? QString::number(session.settings.rgbFrameRateLimitFps) + " fps" : "off")
+                : "not recorded"),
             QString("- RGB missing frame IDs / incomplete frames / queue overflows: %1")
                 .arg(session.settings.recordRgb
                     ? QString("%1 / %2 / %3").arg(groupedCount(session.rgb.missingFrameIds),
@@ -644,6 +694,20 @@ private:
                 ? QString("- RGB capture start/end (UTC): %1 / %2")
                     .arg(QString::fromStdString(session.rgb.startUtc), QString::fromStdString(session.rgb.endUtc))
                 : QString("- RGB capture: not recorded"),
+            QString("- RGB exposure start/end edges in DVXplorer stream: %1 / %2")
+                .arg(session.settings.recordEvents && session.settings.recordRgb
+                        ? groupedCount(session.exposureSync.starts) : "not recorded",
+                    session.settings.recordEvents && session.settings.recordRgb
+                        ? groupedCount(session.exposureSync.ends) : "not recorded"),
+            QString("- Complete exposure windows / repeated starts / unmatched ends: %1 / %2 / %3")
+                .arg(session.settings.recordEvents && session.settings.recordRgb
+                        ? groupedCount(session.exposureSync.completeWindows) : "not recorded",
+                    session.settings.recordEvents && session.settings.recordRgb
+                        ? groupedCount(session.exposureSync.repeatedStarts) : "not recorded",
+                    session.settings.recordEvents && session.settings.recordRgb
+                        ? groupedCount(session.exposureSync.unmatchedEnds) : "not recorded"),
+            QString("- Exposure windows in DVXplorer time: %1").arg(session.rgbExposureFile.empty()
+                ? "not recorded" : "`" + QString::fromStdString(session.rgbExposureFile.filename().string()) + "`"),
             QString("- Peak recorded events in a one-second camera-timestamp bin: %1")
                 .arg(session.settings.recordEvents
                     ? groupedCount(session.peakEventsPerSecond) : "not recorded"),
@@ -676,6 +740,28 @@ private:
         if (!reason.isEmpty()) report << QString("- Interruption reason: %1").arg(reason);
         if (!session.rgb.error.empty()) report << "- RGB error: " + QString::fromStdString(session.rgb.error);
         if (!session.monitorError.isEmpty()) report << "- Monitoring error: " + session.monitorError;
+        if (session.settings.recordEvents && session.settings.recordRgb) {
+            const auto &sync = session.exposureSync;
+            const bool invalidSequence = sync.repeatedStarts || sync.unmatchedEnds || sync.invalidDurations;
+            const bool countMismatch = sync.completeWindows + 2 < session.rgb.frames
+                || session.rgb.frames + 2 < sync.completeWindows;
+            const QString syncStatus = !sync.completeWindows ? "no complete exposure markers detected"
+                : invalidSequence ? "edge sequence contains anomalies"
+                : countMismatch ? "exposure-window count differs from saved RGB frame count"
+                : "edge sequence plausible; frame-to-window matching still requires validation";
+            report << "" << "## RGB–event exposure synchronization" << ""
+                << QString("- Status: %1").arg(syncStatus)
+                << QString("- Complete windows: %1; RGB frames saved: %2")
+                    .arg(groupedCount(sync.completeWindows), groupedCount(session.rgb.frames))
+                << QString("- Invalid durations: %1; open start at stop: %2")
+                    .arg(groupedCount(sync.invalidDurations), sync.pendingStartUs ? "yes" : "no")
+                << QString("- Windows with both edges on one DVX timestamp: %1")
+                    .arg(groupedCount(sync.zeroDurationWindows))
+                << QString("- Observed window duration minimum / maximum: %1 / %2 us")
+                    .arg(sync.shortestWindowUs ? QString::number(*sync.shortestWindowUs) : "unavailable",
+                        sync.longestWindowUs ? QString::number(*sync.longestWindowUs) : "unavailable")
+                << "A recording can contain an incomplete exposure at either boundary. Zero-width timestamp windows can result from coarse timestamp resolution, especially with UltraShort exposure; they do not measure a zero physical exposure. Check the frame index and exposure-window CSV before pairing frames with events.";
+        }
         report << "" << "## Monitoring samples" << "";
         if (session.monitorFile.empty()) {
             report << "No monitoring CSV was created (monitoring was disabled or CSV creation failed).";
@@ -745,7 +831,8 @@ private:
             << "Relative capture lag is a change from the first event batch, not absolute sensor latency."
             << "The 10 ms rate is computed from received events in fixed camera-timestamp bins, not from USB byte counts. The negotiated USB speed is a link rating, not measured traffic or proof of zero loss."
             << "Lag episodes count crossings above 50 ms; one-second latest-lag samples may miss a short spike, so compare them with the interval maximum. Device write latency and in-flight I/O include other processes."
-            << "When RGB is recorded, frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss. When both sources are recorded, their camera clocks are independent without an external electrical sync signal."
+            << "When RGB is recorded, frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss."
+            << "For paired recording, exposure edges are in the DVXplorer clock. Falling marks start and rising marks end if Daheng Line1 is wired active-low. The separate RGB camera ticks are not clock-synchronized; compare complete exposure windows with RGB frames and allow for partial windows at recording boundaries. An edge count alone does not prove each frame is matched. UltraShort pulses can be distorted or missed by the opto-isolated output and external input."
             << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
             << "";
 
@@ -773,8 +860,10 @@ private:
             };
             std::future<RgbPreviewAttempt> rgbPreviewAttempt;
             QString rgbPreviewAttemptSerial;
+            RgbCaptureOptions rgbPreviewAttemptOptions;
             std::optional<Session> session;
             std::optional<std::ofstream> monitorLog;
+            std::optional<std::ofstream> exposureLog;
             try {
                 std::unique_ptr<dv::io::camera::DVXplorer> camera;
                 int eventWidth = 0, eventHeight = 0;
@@ -1090,6 +1179,37 @@ private:
                         }
                         rgb.reset();
                     }
+                    // The Daheng stream is stopped first, so no new exposure edges can
+                    // arrive. Drain the DVXplorer's pending trigger packets before
+                    // finalizing its AEDAT4 writer and the exposure index.
+                    if (writer && camera) {
+                        while (true) {
+                            auto pending = camera->getNextTriggerBatch();
+                            if (!pending || pending->empty()) break;
+                            for (const auto &trigger : *pending) {
+                                writer->writeTrigger(trigger);
+                                ++session->triggers;
+                                if (!exposureLog) continue;
+                                const auto type = trigger.type();
+                                if (type != dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE
+                                    && type != dv::TriggerType::EXTERNAL_SIGNAL_RISING_EDGE) continue;
+                                auto window = session->exposureSync.observe(
+                                    type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE, trigger.timestamp());
+                                if (window) {
+                                    *exposureLog << session->exposureSync.completeWindows << ',' << window->first
+                                        << ',' << window->second << ',' << window->second - window->first << '\n';
+                                }
+                            }
+                        }
+                    }
+                    if (exposureLog) {
+                        exposureLog->flush();
+                        if (!exposureLog->good()) {
+                            outcome = "interrupted";
+                            detail = "RGB exposure index write failed";
+                        }
+                        exposureLog.reset();
+                    }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     if (writer) {
                         writer.reset(); // AEDAT4 index and buffered packets are finalized here.
@@ -1157,7 +1277,8 @@ private:
                     if (rgbPreviewAttempt.valid()
                         && rgbPreviewAttempt.wait_for(0ms) == std::future_status::ready) {
                         auto result = rgbPreviewAttempt.get();
-                        if (rgbPreviewAttemptSerial != current.rgbSerial) {
+                        if (rgbPreviewAttemptSerial != current.rgbSerial
+                            || rgbPreviewAttemptOptions != rgbOptions(current)) {
                             nextRgbPreviewAttempt = loopStart;
                         }
                         else if (result.camera) {
@@ -1175,12 +1296,14 @@ private:
                         && !rgbPreviewAttempt.valid() && loopStart >= nextRgbPreviewAttempt) {
                         try {
                             rgbPreviewAttemptSerial = current.rgbSerial;
+                            rgbPreviewAttemptOptions = rgbOptions(current);
                             rgbPreviewAttempt = std::async(std::launch::async,
-                                [serial = current.rgbSerial.toStdString(), rgbPreviewCallback]() {
+                                [serial = current.rgbSerial.toStdString(), options = rgbOptions(current),
+                                    rgbPreviewCallback]() {
                                     RgbPreviewAttempt result;
                                     try {
                                         result.camera = std::make_unique<RgbRecorder>(fs::path{},
-                                            serial, rgbPreviewCallback, true);
+                                            serial, rgbPreviewCallback, true, options);
                                         result.camera->start();
                                     }
                                     catch (const std::exception &e) {
@@ -1228,6 +1351,7 @@ private:
                             if (!commands.apply->recordEvents && !commands.apply->recordRgb)
                                 throw std::runtime_error("Enable RGB, events, or both");
                             if (current.rgbSerial != commands.apply->rgbSerial
+                                || rgbOptions(current) != rgbOptions(*commands.apply)
                                 || !commands.apply->recordRgb) {
                                 if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                                 rgbPreview.reset();
@@ -1289,13 +1413,15 @@ private:
                             const fs::path output = sessionDirectory / "events.aedat4";
                             if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
+                            if (current.recordEvents) camera->getNextTriggerBatch(); // Discard idle preview edges.
                             if (current.recordEvents) writer.emplace(output.string(), *camera);
                             session = Session{sessionDirectory, output, current,
                                 current.recordEvents ? QString::fromStdString(camera->getCameraName()) : QString{}, utcNow()};
                             if (current.recordEvents) session->dvUsbLink = dvxplorerUsbLink(camera->getCameraName());
                             if (current.recordRgb) {
                                 rgb = std::make_unique<RgbRecorder>(sessionDirectory, current.rgbSerial.toStdString(),
-                                    previewEnabled_ && previewRgb ? rgbPreviewCallback : RgbRecorder::PreviewCallback{});
+                                    previewEnabled_ && previewRgb ? rgbPreviewCallback : RgbRecorder::PreviewCallback{},
+                                    false, rgbOptions(current));
                                 rgb->start();
                                 emit rgbCameraStatus("RGB recording: " + QString::fromStdString(rgb->snapshot().serial));
                                 session->rgbRawFile = rgb->rawPath();
@@ -1303,6 +1429,13 @@ private:
                                 session->rgb = rgb->snapshot();
                             }
                             else emit rgbCameraStatus("RGB recording disabled");
+                            if (current.recordEvents && current.recordRgb) {
+                                session->rgbExposureFile = sessionDirectory / "rgb.exposures.csv";
+                                exposureLog.emplace(session->rgbExposureFile, std::ios::out | std::ios::trunc);
+                                if (!exposureLog->is_open()) throw std::runtime_error("Cannot create RGB exposure index");
+                                *exposureLog << "window_index,start_dvx_us,end_dvx_us,duration_us\n";
+                                if (!exposureLog->good()) throw std::runtime_error("Cannot write RGB exposure index");
+                            }
                             session->startUtc = utcNow();
                             session->reportFile = sessionDirectory / "report.md";
                             session->storageDeviceName = storageDevice(directory);
@@ -1377,6 +1510,7 @@ private:
                                 rgb.reset();
                             }
                             monitorLog.reset();
+                            exposureLog.reset();
                             writer.reset();
                             session.reset();
                             std::error_code removeError;
@@ -1489,6 +1623,21 @@ private:
                                 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                             for (const auto &trigger : *triggers) {
                                 writer->writeTrigger(trigger);
+                                if (exposureLog) {
+                                    const auto type = trigger.type();
+                                    if (type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE
+                                        || type == dv::TriggerType::EXTERNAL_SIGNAL_RISING_EDGE) {
+                                        auto window = session->exposureSync.observe(
+                                            type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE,
+                                            trigger.timestamp());
+                                        if (window) {
+                                            *exposureLog << session->exposureSync.completeWindows << ',' << window->first
+                                                << ',' << window->second << ',' << window->second - window->first << '\n';
+                                            if (!exposureLog->good())
+                                                throw std::runtime_error("RGB exposure index write failed");
+                                        }
+                                    }
+                                }
                             }
                             session->triggers += triggers->size();
                             if (current.storageMonitoring) {
@@ -1566,6 +1715,7 @@ private:
                 const QString error = QString::fromUtf8(e.what());
                 if (session) {
                     if (rgb) { session->rgb = rgb->stop(); rgb.reset(); }
+                    if (exposureLog) { exposureLog->flush(); exposureLog.reset(); }
                     const auto beforeFinalize = std::chrono::steady_clock::now();
                     if (writer) writer.reset();
                     session->endUtc = utcNow();
@@ -1696,6 +1846,12 @@ public:
         storage_ = new QCheckBox("Storage monitoring (write rate, stalls, disk backlog)", formContainer);
         rgbSerial_ = new QLineEdit(formContainer);
         rgbSerial_->setPlaceholderText("Auto-select MER2-302-56U3C");
+        manualExposure_ = new QCheckBox("Set fixed RGB exposure", formContainer);
+        ultraShort_ = new QCheckBox("UltraShort RGB exposure (1–100 us)", formContainer);
+        exposureUs_ = spin(1, 1'000'000, 1000, formContainer);
+        exposureUs_->setSuffix(" us");
+        frameRateLimit_ = spin(0, 56, 0, formContainer);
+        frameRateLimit_->setSpecialValueText("Off (camera maximum)");
         loadSettings(settings_);
         form->addRow("ON contrast (0-17)", on_);
         form->addRow("OFF contrast (0-17)", off_);
@@ -1703,13 +1859,18 @@ public:
         form->addRow(recordEvents_);
         form->addRow(recordRgb_);
         form->addRow("RGB serial (optional)", rgbSerial_);
+        form->addRow(manualExposure_);
+        form->addRow(ultraShort_);
+        form->addRow("RGB exposure", exposureUs_);
+        form->addRow("RGB maximum frame rate", frameRateLimit_);
         form->addRow(performance_);
         form->addRow(temperature_);
         form->addRow(storage_);
         auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
             "Select at least one recording source. RGB frames are saved as uncompressed BayerRG8 with a frame index. "
             "Only the selected camera is previewed. Monitoring samples once per second and saves a CSV beside the recording. "
-            "Settings are locked during recording.", formContainer);
+            "ExposureActive is output on Daheng Line1 for testing the wired DVXplorer exposure markers. "
+            "UltraShort requires strong lighting; camera settings are locked during recording.", formContainer);
         note->setWordWrap(true);
         form->addRow(note);
         scroll->setWidget(formContainer);
@@ -1723,6 +1884,14 @@ public:
         settingsButtons->addWidget(cancel);
         settingsLayout->addLayout(settingsButtons);
         pages_->addWidget(settingsPage);
+
+        connect(manualExposure_, &QCheckBox::toggled, this, [this](bool enabled) {
+            ultraShort_->setEnabled(enabled);
+            exposureUs_->setEnabled(enabled);
+        });
+        connect(ultraShort_, &QCheckBox::toggled, this, [this](bool enabled) {
+            exposureUs_->setRange(enabled ? 1 : 20, enabled ? 100 : 1'000'000);
+        });
 
         connect(browse, &QPushButton::clicked, this, [this] {
             const QString folder = QFileDialog::getExistingDirectory(this, "Recording directory", output_->text());
@@ -1744,6 +1913,12 @@ public:
             }
             if (draft.outputDirectory.trimmed().isEmpty()) {
                 status_->setText("Choose a recording directory");
+                pages_->setCurrentIndex(0);
+                return;
+            }
+            if (draft.rgbManualExposure && (draft.rgbExposureUs < (draft.rgbUltraShortExposure ? 1 : 20)
+                || draft.rgbExposureUs > (draft.rgbUltraShortExposure ? 100 : 1'000'000))) {
+                status_->setText("Choose an RGB exposure time in the selected mode's range");
                 pages_->setCurrentIndex(0);
                 return;
             }
@@ -1904,7 +2079,9 @@ private:
     Settings readSettings() const {
         return {output_->text().trimmed(), on_->value(), off_->value(), interval_->value(),
             performance_->isChecked(), temperature_->isChecked(), storage_->isChecked(),
-            rgbSerial_->text().trimmed(), recordEvents_->isChecked(), recordRgb_->isChecked()};
+            rgbSerial_->text().trimmed(), recordEvents_->isChecked(), recordRgb_->isChecked(),
+            manualExposure_->isChecked(), ultraShort_->isChecked(), exposureUs_->value(),
+            frameRateLimit_->value()};
     }
 
     void loadSettings(const Settings &settings) {
@@ -1918,6 +2095,14 @@ private:
         rgbSerial_->setText(settings.rgbSerial);
         recordEvents_->setChecked(settings.recordEvents);
         recordRgb_->setChecked(settings.recordRgb);
+        manualExposure_->setChecked(settings.rgbManualExposure);
+        ultraShort_->setChecked(settings.rgbUltraShortExposure);
+        ultraShort_->setEnabled(settings.rgbManualExposure);
+        exposureUs_->setEnabled(settings.rgbManualExposure);
+        exposureUs_->setRange(settings.rgbUltraShortExposure ? 1 : 20,
+            settings.rgbUltraShortExposure ? 100 : 1'000'000);
+        exposureUs_->setValue(settings.rgbExposureUs);
+        frameRateLimit_->setValue(settings.rgbFrameRateLimitFps);
     }
 
     void refreshPreview() {
@@ -1966,6 +2151,10 @@ private:
     QCheckBox *recordEvents_ = nullptr;
     QCheckBox *recordRgb_ = nullptr;
     QLineEdit *rgbSerial_ = nullptr;
+    QCheckBox *manualExposure_ = nullptr;
+    QCheckBox *ultraShort_ = nullptr;
+    QSpinBox *exposureUs_ = nullptr;
+    QSpinBox *frameRateLimit_ = nullptr;
     QPixmap lastImage_;
     int eventWindowMs_ = 10;
     bool filterEventNoise_ = true;

@@ -74,11 +74,11 @@ RgbRecorder::Preview thumbnailBayerRG8(const char *bayer, uint32_t width, uint32
 } // namespace
 
 RgbRecorder::RgbRecorder(std::filesystem::path sessionDirectory, std::string requestedSerial,
-    PreviewCallback previewCallback, bool previewOnly)
+    PreviewCallback previewCallback, bool previewOnly, RgbCaptureOptions options)
     : rawPath_(sessionDirectory / "rgb.raw"),
       indexPath_(sessionDirectory / "rgb.frames.csv"),
       requestedSerial_(std::move(requestedSerial)),
-      previewCallback_(std::move(previewCallback)), previewOnly_(previewOnly) {}
+      previewCallback_(std::move(previewCallback)), previewOnly_(previewOnly), options_(options) {}
 
 RgbRecorder::~RgbRecorder() {
     stop();
@@ -148,6 +148,46 @@ void RgbRecorder::start() {
         check(GXSetEnumValueByString(device_, "AcquisitionMode", "Continuous"), "AcquisitionMode");
         check(GXSetEnumValueByString(device_, "TriggerSelector", "FrameStart"), "TriggerSelector FrameStart");
         check(GXSetEnumValueByString(device_, "TriggerMode", "Off"), "TriggerMode Off");
+        // Line1 is the camera's isolated output. With a 5 V pull-up its falling
+        // edge marks exposure start and its rising edge marks exposure end.
+        check(GXSetEnumValueByString(device_, "LineSelector", "Line1"), "LineSelector Line1");
+        check(GXSetBoolValue(device_, "LineInverter", false), "LineInverter Off");
+        check(GXSetEnumValueByString(device_, "LineSource", "ExposureActive"), "LineSource ExposureActive");
+        if (options_.manualExposure) {
+            if (options_.exposureUs < (options_.ultraShortExposure ? 1 : 20)
+                || options_.exposureUs > (options_.ultraShortExposure ? 100 : 1'000'000)) {
+                throw std::runtime_error("RGB exposure time is outside the selected mode's range");
+            }
+            check(GXSetEnumValueByString(device_, "ExposureAuto", "Off"), "ExposureAuto Off");
+            check(GXSetEnumValueByString(device_, "ExposureTimeMode",
+                options_.ultraShortExposure ? "UltraShort" : "Standard"), "ExposureTimeMode");
+            GX_FLOAT_VALUE range{};
+            check(GXGetFloatValue(device_, "ExposureTime", &range), "ExposureTime range");
+            if (options_.exposureUs < range.dMin || options_.exposureUs > range.dMax) {
+                throw std::runtime_error("RGB exposure time is outside the connected camera's range");
+            }
+            check(GXSetFloatValue(device_, "ExposureTime", options_.exposureUs), "ExposureTime");
+        }
+        if (options_.frameRateLimitFps > 0) {
+            GX_FLOAT_VALUE range{};
+            check(GXSetEnumValueByString(device_, "AcquisitionFrameRateMode", "On"),
+                "AcquisitionFrameRateMode On");
+            check(GXGetFloatValue(device_, "AcquisitionFrameRate", &range), "AcquisitionFrameRate range");
+            if (options_.frameRateLimitFps < range.dMin || options_.frameRateLimitFps > range.dMax) {
+                throw std::runtime_error("RGB frame-rate limit is outside the connected camera's range");
+            }
+            check(GXSetFloatValue(device_, "AcquisitionFrameRate", options_.frameRateLimitFps),
+                "AcquisitionFrameRate");
+        }
+        else {
+            check(GXSetEnumValueByString(device_, "AcquisitionFrameRateMode", "Off"),
+                "AcquisitionFrameRateMode Off");
+        }
+        GX_FLOAT_VALUE applied{};
+        if (GXGetFloatValue(device_, "ExposureTime", &applied) == GX_STATUS_SUCCESS)
+            summary_.appliedExposureUs = applied.dCurValue;
+        if (GXGetFloatValue(device_, "CurrentAcquisitionFrameRate", &applied) == GX_STATUS_SUCCESS)
+            summary_.appliedFrameRateFps = applied.dCurValue;
         GX_INT_VALUE width{}, height{}, payload{};
         check(GXGetIntValue(device_, "Width", &width), "Width");
         check(GXGetIntValue(device_, "Height", &height), "Height");

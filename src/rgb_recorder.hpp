@@ -16,6 +16,14 @@
 
 namespace dvxrec {
 
+struct RgbCaptureOptions {
+    bool manualExposure = false;
+    bool ultraShortExposure = false;
+    int exposureUs = 1000;
+    int frameRateLimitFps = 0; // 0 disables acquisition frame-rate limiting.
+    bool operator==(const RgbCaptureOptions &) const = default;
+};
+
 // Owns the Galaxy device and two bounded RGB threads. The capture thread never
 // waits for disk I/O; a full queue interrupts the session instead of hiding loss.
 class RgbRecorder final {
@@ -40,11 +48,13 @@ public:
         uint64_t queueDepth = 0;
         uint64_t maxQueueDepth = 0;
         uint64_t bytes = 0;
+        double appliedExposureUs = 0;
+        double appliedFrameRateFps = 0;
         std::string error;
     };
 
     explicit RgbRecorder(std::filesystem::path sessionDirectory, std::string requestedSerial = {},
-        PreviewCallback previewCallback = {}, bool previewOnly = false);
+        PreviewCallback previewCallback = {}, bool previewOnly = false, RgbCaptureOptions options = {});
     ~RgbRecorder();
     RgbRecorder(const RgbRecorder &) = delete;
     RgbRecorder &operator=(const RgbRecorder &) = delete;
@@ -73,6 +83,7 @@ private:
     std::string requestedSerial_;
     PreviewCallback previewCallback_;
     bool previewOnly_ = false;
+    RgbCaptureOptions options_;
     GX_DEV_HANDLE device_ = nullptr;
     bool libraryOpen_ = false;
     bool streamOn_ = false;
