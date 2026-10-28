@@ -286,7 +286,7 @@ void RgbRecorder::captureLoop() noexcept {
                 ready_.notify_one();
             }
             const auto now = std::chrono::steady_clock::now();
-            if (previewAllowed && previewCallback_
+            if (previewAllowed && previewEnabled_.load(std::memory_order_relaxed) && previewCallback_
                 && now - lastPreview >= std::chrono::milliseconds(100)) {
                 previewCallback_(thumbnailBayerRG8(buffer.data(), summary_.width, summary_.height));
                 lastPreview = now;

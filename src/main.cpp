@@ -379,6 +379,7 @@ signals:
     void monitoring(const QString &message);
     void rgbStatistics(quint64 frames, quint64 missing, quint64 incomplete);
     void rgbCameraStatus(const QString &message);
+    void idleTriggerEdges(quint64 falling, quint64 rising);
 
 private:
     void publishRgbPreview(RgbRecorder::Preview frame) {
@@ -871,6 +872,7 @@ private:
                 std::vector<std::uint8_t> eventPreviewPolarities;
                 std::optional<std::int64_t> newestPreviewTimestampUs;
                 std::chrono::steady_clock::time_point lastPreviewEventArrival;
+                quint64 idleFallingEdges = 0, idleRisingEdges = 0;
                 auto connectCamera = [&](const Settings &settings) {
                     auto candidate = std::make_unique<dv::io::camera::DVXplorer>();
                     configure(*candidate, settings);
@@ -886,6 +888,8 @@ private:
                         newestPreviewTimestampUs.reset();
                     }
                     camera = std::move(candidate);
+                    idleFallingEdges = idleRisingEdges = 0;
+                    emit idleTriggerEdges(0, 0);
                     emit cameraStatus(QString("Ready: %1 (%2 x %3)")
                         .arg(QString::fromStdString(camera->getCameraName()))
                         .arg(eventWidth).arg(eventHeight), true);
@@ -899,6 +903,7 @@ private:
                 else emit cameraStatus("Ready: RGB recording (DVXplorer not required)", true);
                 auto lastPreview = std::chrono::steady_clock::now();
                 auto lastStatistics = lastPreview;
+                auto lastIdleEdgeStatus = lastPreview;
                 auto lastDiskCheck = lastPreview;
                 auto lastMonitoring = lastPreview;
                 auto sessionStart = lastPreview;
@@ -1243,6 +1248,8 @@ private:
                                 session->reportError.isEmpty() ? "saved" : session->reportError)
                         : QString("Recording interrupted: %1 (%2)").arg(detail, path));
                     session.reset();
+                    idleFallingEdges = idleRisingEdges = 0;
+                    emit idleTriggerEdges(0, 0);
                 };
 
                 try {
@@ -1283,6 +1290,7 @@ private:
                         }
                         else if (result.camera) {
                             rgbPreview = std::move(result.camera);
+                            rgbPreview->setPreviewEnabled(previewRgb);
                             emit rgbCameraStatus("RGB live: MER2-302-56U3C ("
                                 + QString::fromStdString(rgbPreview->snapshot().serial) + ")");
                         }
@@ -1292,18 +1300,21 @@ private:
                             nextRgbPreviewAttempt = loopStart + 10s;
                         }
                     }
-                    if (previewEnabled_ && previewRgb && current.recordRgb && !session && !rgbPreview
+                    // Keep Daheng acquiring while idle so Line1 emits exposure pulses even
+                    // when only the DVXplorer event image is shown. No RGB files are opened.
+                    if (previewEnabled_ && current.recordRgb && !session && !rgbPreview
                         && !rgbPreviewAttempt.valid() && loopStart >= nextRgbPreviewAttempt) {
                         try {
                             rgbPreviewAttemptSerial = current.rgbSerial;
                             rgbPreviewAttemptOptions = rgbOptions(current);
                             rgbPreviewAttempt = std::async(std::launch::async,
                                 [serial = current.rgbSerial.toStdString(), options = rgbOptions(current),
-                                    rgbPreviewCallback]() {
+                                    showRgbPreview = previewRgb, rgbPreviewCallback]() {
                                     RgbPreviewAttempt result;
                                     try {
                                         result.camera = std::make_unique<RgbRecorder>(fs::path{},
                                             serial, rgbPreviewCallback, true, options);
+                                        result.camera->setPreviewEnabled(showRgbPreview);
                                         result.camera->start();
                                     }
                                     catch (const std::exception &e) {
@@ -1335,15 +1346,15 @@ private:
                                     std::numeric_limits<std::int64_t>::min());
                                 newestPreviewTimestampUs.reset();
                             }
-                            if (!previewRgb) {
-                                if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
-                                rgbPreview.reset();
-                            }
+                            if (rgbPreview) rgbPreview->setPreviewEnabled(previewRgb);
                             QMutexLocker eventsLock(&previewMutex_);
                             latestPreview_ = {};
                             QMutexLocker rgbLock(&rgbPreviewMutex_);
                             latestRgbPreview_ = {};
-                            emit rgbCameraStatus(previewRgb ? "Connecting to Daheng..." : "RGB preview idle");
+                            emit rgbCameraStatus(!current.recordRgb ? "RGB recording disabled"
+                                : rgbPreview ? "RGB live: MER2-302-56U3C ("
+                                    + QString::fromStdString(rgbPreview->snapshot().serial) + ")"
+                                : "Connecting to Daheng...");
                         }
                     }
                     if (commands.apply && !session) {
@@ -1365,6 +1376,7 @@ private:
                             current = *commands.apply;
                             if (!current.recordEvents) previewRgb = true;
                             if (!current.recordRgb) previewRgb = false;
+                            if (rgbPreview) rgbPreview->setPreviewEnabled(previewRgb);
                             lastMonitoring = std::chrono::steady_clock::now();
                             previousCpuClock = std::clock();
                             previousRecorderThreadCpu = recorderThreadCpuSeconds();
@@ -1414,6 +1426,7 @@ private:
                             if (rgbPreviewAttempt.valid()) rgbPreviewAttempt.get();
                             rgbPreview.reset(); // Release the camera before opening the recording stream.
                             if (current.recordEvents) (void)camera->getNextTriggerBatch(); // Discard idle preview edges.
+                            idleFallingEdges = idleRisingEdges = 0;
                             if (current.recordEvents) writer.emplace(output.string(), *camera);
                             session.emplace();
                             session->directory = sessionDirectory;
@@ -1652,10 +1665,24 @@ private:
                                 writerTimeMs += millis;
                             }
                         }
+                        else {
+                            // Only external edges are useful for the idle wiring check.
+                            // The counts are deliberately separate from recorded triggers.
+                            for (const auto &trigger : *triggers) {
+                                if (trigger.type == dv::TriggerType::EXTERNAL_SIGNAL_FALLING_EDGE)
+                                    ++idleFallingEdges;
+                                else if (trigger.type == dv::TriggerType::EXTERNAL_SIGNAL_RISING_EDGE)
+                                    ++idleRisingEdges;
+                            }
+                        }
                     }
                     }
 
                     const auto now = std::chrono::steady_clock::now();
+                    if (!session && camera && now - lastIdleEdgeStatus >= 500ms) {
+                        emit idleTriggerEdges(idleFallingEdges, idleRisingEdges);
+                        lastIdleEdgeStatus = now;
+                    }
                     if (camera && previewEnabled_ && !previewRgb
                         && now - lastPreview >= std::chrono::milliseconds(current.previewIntervalMs)) {
                         QImage preview(eventWidth, eventHeight, QImage::Format_RGB888);
@@ -1809,6 +1836,8 @@ public:
         liveLayout->addWidget(rgbStatus_);
         counts_ = new QLabel("Events: 0 | Triggers: 0", live);
         liveLayout->addWidget(counts_);
+        idleEdges_ = new QLabel("Preview trigger edges (not saved): falling 0 | rising 0", live);
+        liveLayout->addWidget(idleEdges_);
         rgbCounts_ = new QLabel("RGB: 0 frames | Missing IDs: 0 | Incomplete: 0", live);
         liveLayout->addWidget(rgbCounts_);
         monitorStatus_ = new QLabel("Monitoring off", live);
@@ -1873,8 +1902,9 @@ public:
         form->addRow(storage_);
         auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
             "Select at least one recording source. RGB frames are saved as uncompressed BayerRG8 with a frame index. "
-            "Only the selected camera is previewed. Monitoring samples once per second and saves a CSV beside the recording. "
-            "ExposureActive is output on Daheng Line1 for testing the wired DVXplorer exposure markers. "
+            "Only the selected camera image is displayed; Daheng still acquires while idle when RGB is enabled, "
+            "so Line1 outputs ExposureActive and the DVXplorer counts input edges without recording. "
+            "Monitoring samples once per second and saves a CSV beside the recording. "
             "UltraShort requires strong lighting; camera settings are locked during recording.", formContainer);
         note->setWordWrap(true);
         form->addRow(note);
@@ -1980,6 +2010,8 @@ public:
         connect(&recorder_, &Recorder::recordingState, this, [this](bool recording, const QString &message) {
             recording_ = recording;
             busy_ = false;
+            idleEdges_->setText(recording ? "Preview trigger edges: paused during recording"
+                : "Preview trigger edges (not saved): falling 0 | rising 0");
             status_->setText(message);
             updateButtons();
         });
@@ -2003,12 +2035,18 @@ public:
                 refreshPreview();
                 if (!settings_.recordEvents) counts_->setText("DVXplorer events: not recorded");
                 else counts_->setText("Events: 0 | Triggers: 0");
+                if (!settings_.recordEvents) idleEdges_->setText("Preview trigger input: disabled");
                 if (!settings_.recordRgb) rgbCounts_->setText("RGB frames: not recorded");
                 else rgbCounts_->setText("RGB: 0 frames | Missing IDs: 0 | Incomplete: 0");
             }
             pendingSettings_.reset();
             status_->setText(message);
             updateButtons();
+        });
+        connect(&recorder_, &Recorder::idleTriggerEdges, this, [this](quint64 falling, quint64 rising) {
+            if (!recording_ && settings_.recordEvents)
+                idleEdges_->setText(QString("Preview trigger edges (not saved): falling %1 | rising %2")
+                    .arg(groupedCount(falling), groupedCount(rising)));
         });
         connect(&recorder_, &Recorder::statistics, this, [this](quint64 events, quint64 triggers) {
             if (!settings_.recordEvents) return;
@@ -2034,7 +2072,10 @@ public:
             }
         });
         timer->start(16); // Poll often enough to display every 33 ms event frame.
-        if (!settings_.recordEvents) counts_->setText("DVXplorer events: not recorded");
+        if (!settings_.recordEvents) {
+            counts_->setText("DVXplorer events: not recorded");
+            idleEdges_->setText("Preview trigger input: disabled");
+        }
         if (!settings_.recordRgb) rgbCounts_->setText("RGB frames: not recorded");
         updateButtons();
     }
@@ -2140,6 +2181,7 @@ private:
     QLabel *status_ = nullptr;
     QLabel *rgbStatus_ = nullptr;
     QLabel *counts_ = nullptr;
+    QLabel *idleEdges_ = nullptr;
     QLabel *rgbCounts_ = nullptr;
     QLabel *monitorStatus_ = nullptr;
     QPushButton *record_ = nullptr;

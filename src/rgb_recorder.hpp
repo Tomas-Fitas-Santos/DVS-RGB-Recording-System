@@ -62,6 +62,8 @@ public:
     void start();
     Summary stop();
     Summary snapshot() const;
+    // Keep acquisition running for exposure output while skipping RGB thumbnail work.
+    void setPreviewEnabled(bool enabled) { previewEnabled_.store(enabled, std::memory_order_relaxed); }
     const std::filesystem::path &rawPath() const { return rawPath_; }
     const std::filesystem::path &indexPath() const { return indexPath_; }
 
@@ -94,6 +96,7 @@ private:
     std::deque<Frame> queue_;
     Summary summary_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> previewEnabled_{true};
     std::thread capture_;
     std::thread writer_;
 };
