@@ -22,3 +22,9 @@ add_executable(dvxplorer_recorder src/main.cpp src/rgb_recorder.cpp)
 target_include_directories(dvxplorer_recorder PRIVATE "${GALAXY_INCLUDE_DIR}")
 target_link_libraries(dvxplorer_recorder PRIVATE Qt6::Widgets dv::processing Threads::Threads "${GALAXY_LIBRARY}")
 target_compile_options(dvxplorer_recorder PRIVATE -Wall -Wextra -Wpedantic)
+
+# Isolates the physical Line2 GPIO and cable from RGB exposure/acquisition.
+add_executable(daheng_line2_test src/line2_test.cpp)
+target_include_directories(daheng_line2_test PRIVATE "${GALAXY_INCLUDE_DIR}")
+target_link_libraries(daheng_line2_test PRIVATE "${GALAXY_LIBRARY}")
+target_compile_options(daheng_line2_test PRIVATE -Wall -Wextra -Wpedantic)

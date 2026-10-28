@@ -140,6 +140,21 @@ The app reports whether Galaxy enumerated zero devices, found a different model 
 
 With the app stopped, run `lsusb` and `lsusb -t` on the Pi. Confirm that the Daheng camera is physically listed and attached over USB 3 (`5000M`) through a blue port or a suitable powered USB 3 hub. The Galaxy SDK installer says to unplug and reconnect USB3 cameras after installation; do that if the app reports zero devices. If USB lists the camera but Galaxy still finds none, inspect the SDK's udev permissions for the `birds` user. If the app detects the exact model and serial but cannot open it, close GalaxyView or any other application that has the camera open and check the reported Galaxy status. A nonmatching serial entered in Settings also prevents selection. Keep the full status text when reporting the problem; "not found" alone cannot distinguish these cases.
 
+### Verify the Daheng Line2 wire without recording
+
+The Galaxy feature name `Line2` selects the camera's GPIO output independently of connector pin numbering. The Daheng MER2/ME2P manual labels it **pin 5** and GPIO GND **pin 2** in the **back view of the camera receptacle**; a view into the cable's mating plug is mirrored. The manual's core colors are orange for pin 5 and blue for pin 2, but confirm the mapping for the particular cable in use. Never identify a contact solely by viewing a diagram from the opposite side.
+
+With power off, verify that the resistor's camera-side test point actually goes to Line2/pin 5, and that the scope ground test point goes to GPIO GND/pin 2. For the bench circuit use a 5 V supply through a 1 kΩ resistor to the Line2 test point, with its 0 V connected to GPIO GND. Scope the **resistor's camera side** relative to that 0 V; the 5 V supply side will stay flat. Stop the recorder first so the test program can open the camera exclusively:
+
+```bash
+cd ~/Desktop/DVS-RGB-Recording-System
+bash scripts/recorder.sh stop
+bash scripts/recorder.sh build
+./build/daheng_line2_test FDS25090548
+```
+
+Replace the example serial with the camera's actual serial, or omit it if only one MER2-302-56U3C is attached. The utility sets Line2 to `Output`, selects `UserOutput0` and alternates its value every 500 ms for 10 seconds. It does **not** acquire frames or create recordings. Use DC coupling and a roughly 500 ms/div scope time base. A 1 Hz waveform at the accessible Line2 junction confirms the software can switch the GPIO and that this wire reaches it; a flat trace means to check the actual wire/connector mapping, 5 V pull-up and ground before diagnosing `ExposureActive`. If the 1 Hz test succeeds but RGB preview produces no exposure pulses, check that RGB frames update and that the fixed exposure and frame rate settings have been applied. The recorder restores `ExposureActive` when it next opens the camera.
+
 ### Paired-camera exposure-marker test
 
 With power removed, wire Daheng **Line2 GPIO (pin 5)** to DVXplorer **SIGNAL_IN** and to a regulated **5 V through a 1 kΩ pull-up resistor**. Wire Daheng **GPIO GND (pin 2)** to the supply 0 V and DVXplorer **GND_IN**; supply that same 5 V to DVXplorer **VDD_IN**, and connect **CLOCK_IN** to **VDD_IN** if no clock signal is used. Confirm the Hirose connector orientation and actual wire continuity against both camera manuals before powering on. Connect to the DVXplorer **INPUT SYNC** connector, never its output connector. Line2 is a configurable GPIO output and is not optically isolated; the shared ground is required. The Daheng manual specifies a 5 V, 1 kΩ pull-up example for Line2 output (about 4.8 mA when low). Pin 8/7 (Line1) is not driven by this configuration.
