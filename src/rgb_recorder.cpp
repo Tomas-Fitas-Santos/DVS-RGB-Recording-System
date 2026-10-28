@@ -148,9 +148,10 @@ void RgbRecorder::start() {
         check(GXSetEnumValueByString(device_, "AcquisitionMode", "Continuous"), "AcquisitionMode");
         check(GXSetEnumValueByString(device_, "TriggerSelector", "FrameStart"), "TriggerSelector FrameStart");
         check(GXSetEnumValueByString(device_, "TriggerMode", "Off"), "TriggerMode Off");
-        // Line1 is the camera's isolated output. With a 5 V pull-up its falling
-        // edge marks exposure start and its rising edge marks exposure end.
-        check(GXSetEnumValueByString(device_, "LineSelector", "Line1"), "LineSelector Line1");
+        // Pin 5 is Line2, a configurable GPIO output (pin 2 is its ground).
+        // With the external 5 V / 1 kOhm pull-up, Line2 pulls low during exposure.
+        check(GXSetEnumValueByString(device_, "LineSelector", "Line2"), "LineSelector Line2");
+        check(GXSetEnumValueByString(device_, "LineMode", "Output"), "LineMode Output");
         check(GXSetBoolValue(device_, "LineInverter", false), "LineInverter Off");
         check(GXSetEnumValueByString(device_, "LineSource", "ExposureActive"), "LineSource ExposureActive");
         if (options_.manualExposure) {

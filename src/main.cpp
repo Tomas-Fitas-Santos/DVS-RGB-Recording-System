@@ -833,7 +833,7 @@ private:
             << "The 10 ms rate is computed from received events in fixed camera-timestamp bins, not from USB byte counts. The negotiated USB speed is a link rating, not measured traffic or proof of zero loss."
             << "Lag episodes count crossings above 50 ms; one-second latest-lag samples may miss a short spike, so compare them with the interval maximum. Device write latency and in-flight I/O include other processes."
             << "When RGB is recorded, frame IDs expose detected gaps; a zero count does not prove no sensor or transport loss."
-            << "For paired recording, exposure edges are in the DVXplorer clock. Falling marks start and rising marks end if Daheng Line1 is wired active-low. The separate RGB camera ticks are not clock-synchronized; compare complete exposure windows with RGB frames and allow for partial windows at recording boundaries. An edge count alone does not prove each frame is matched. UltraShort pulses can be distorted or missed by the opto-isolated output and external input."
+            << "For paired recording, exposure edges are in the DVXplorer clock. Falling marks start and rising marks end if Daheng Line2 is wired active-low. The separate RGB camera ticks are not clock-synchronized; compare complete exposure windows with RGB frames and allow for partial windows at recording boundaries. An edge count alone does not prove each frame is matched. UltraShort pulses can be distorted or missed by the Daheng GPIO output and DVXplorer input."
             << "Read the monitoring CSV for individual samples and the adjacent JSON for machine-readable session metadata."
             << "";
 
@@ -1300,7 +1300,7 @@ private:
                             nextRgbPreviewAttempt = loopStart + 10s;
                         }
                     }
-                    // Keep Daheng acquiring while idle so Line1 emits exposure pulses even
+                    // Keep Daheng acquiring while idle so Line2 emits exposure pulses even
                     // when only the DVXplorer event image is shown. No RGB files are opened.
                     if (previewEnabled_ && current.recordRgb && !session && !rgbPreview
                         && !rgbPreviewAttempt.valid() && loopStart >= nextRgbPreviewAttempt) {
@@ -1903,7 +1903,7 @@ public:
         auto *note = new QLabel("ON/OFF contrast changes camera sensitivity. The preview interval affects only the screen. "
             "Select at least one recording source. RGB frames are saved as uncompressed BayerRG8 with a frame index. "
             "Only the selected camera image is displayed; Daheng still acquires while idle when RGB is enabled, "
-            "so Line1 outputs ExposureActive and the DVXplorer counts input edges without recording. "
+            "so Line2 (pin 5) outputs ExposureActive and the DVXplorer counts input edges without recording. "
             "Monitoring samples once per second and saves a CSV beside the recording. "
             "UltraShort requires strong lighting; camera settings are locked during recording.", formContainer);
         note->setWordWrap(true);
